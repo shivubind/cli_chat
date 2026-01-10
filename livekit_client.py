@@ -190,6 +190,7 @@ class LiveKitClient:
     async def _handle_audio_track(self, track: rtc.Track):
         """Handle incoming audio from remote participant"""
         audio_stream = rtc.AudioStream(track)
+        frame_count = 0
         
         async for event in audio_stream:
             if not self.running:
@@ -202,6 +203,16 @@ class LiveKitClient:
             
             # Get audio data and play
             audio_data = bytes(frame.data)
+            
+            # Check if there's actual audio (not silence)
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+            
+            if rms > 100:  # Non-silence threshold
+                if frame_count == 0:
+                    print(f"🔊 Receiving audio... (rms={rms:.0f})")
+                frame_count += 1
+            
             self.speaker.play(audio_data)
     
     async def publish_microphone(self):

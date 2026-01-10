@@ -1,0 +1,188 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# VChat Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# LiveKit Server Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+livekit:
+  url: "ws://localhost:7880"
+  api_key: "devkey"
+  api_secret: "secret"
+  room: "vchat-room"
+  agent_identity: "ai-agent"
+  agent_name: "AI Voice Agent"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# System Prompt - Define AI personality and behavior
+# ─────────────────────────────────────────────────────────────────────────────────
+system:
+  # Main system prompt - customize AI behavior
+  prompt: |
+    You are a helpful voice assistant with memory. Keep responses SHORT and CONCISE.
+    - Answer in 1-2 sentences unless more detail is explicitly requested
+    - Be friendly and natural in conversation
+    - If asked to describe what you see, analyze the provided image
+    - IMPORTANT: If "Relevant memories" are provided, USE them to personalize your response
+    - Remember and use the user's name, preferences, and past context when relevant
+    - If the user asks about something you remember, refer to it naturally
+  
+  # Greeting message when agent starts
+  greeting: "Hello! I'm your voice assistant. How can I help?"
+  
+  # Keywords that trigger vision/camera capture
+  vision_triggers:
+    - "what do you see"
+    - "what can you see"
+    - "look at this"
+    - "describe what you see"
+    - "what's in front of you"
+    - "can you see"
+    - "show me what you see"
+    - "what am i showing you"
+    - "analyze this"
+    - "what's this"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Speech-to-Text (STT) Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+stt:
+  # Whisper model: tiny, base, small, medium, large, large-v2, large-v3
+  # Smaller = faster, larger = more accurate
+  model: "small"
+  language: "en"
+  
+  # Use GPU if available
+  use_gpu: true
+  
+  # Transcription settings
+  temperature: 0.0
+  no_speech_threshold: 0.5
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Large Language Model (LLM) Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+llm:
+  # Ollama settings
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+  
+  # Text model for conversation
+  text_model: "qwen3-vl:2b-instruct-bf16" # "qwen2.5:0.5b"
+  
+  # Vision model for image analysis (must support vision)
+  # Options: moondream (fast), llava (accurate), llava:13b, bakllava, etc.
+  vision_model: "qwen3-vl:2b-instruct-bf16"
+  
+  # Generation settings
+  temperature: 0.7
+  max_tokens: 256
+  
+  # Stream response (faster perceived response)
+  stream: false
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Text-to-Speech (TTS) Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+tts:
+  # Kokoro settings
+  provider: "kokoro"
+  
+  # Voice ID - Kokoro voices:
+  # af_heart, af_bella, af_nicole, af_sarah, af_sky
+  # am_adam, am_michael, bf_emma, bf_isabella, bm_george, bm_lewis
+  voice: "am_puck"
+  
+  # Speech speed (0.5 = slow, 1.0 = normal, 2.0 = fast)
+  speed: 1.0
+  
+  # Output sample rate
+  sample_rate: 24000
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Audio Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+audio:
+  # Sample rate for audio processing
+  sample_rate: 48000
+  channels: 1
+  
+  # Chunk size in samples (960 = 20ms at 48kHz)
+  chunk_size: 960
+  
+  # Voice Activity Detection (VAD)
+  vad:
+    # RMS threshold for speech detection (0.0-1.0)
+    # Lower = more sensitive, Higher = less sensitive
+    threshold: 0.02
+    
+    # Strong speech threshold for barge-in detection
+    barge_in_threshold: 0.05
+    
+    # Seconds of silence before processing speech
+    silence_duration: 0.5
+    
+    # Minimum speech duration to process (seconds)
+    min_speech_duration: 0.5
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Vision Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+vision:
+  # Enable vision capability
+  enabled: true
+  
+  # Camera device index (0 = default camera)
+  camera_index: 0
+  
+  # Image capture settings
+  width: 640
+  height: 480
+  
+  # Vision prompt template (be explicit about language)
+  prompt: "You are looking at an image. Describe what you see in English. Be concise, use 1-2 sentences."
+  
+  # Save captured images for debugging (check ./captures folder)
+  save_captures: true
+  captures_dir: "./captures"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Memory Configuration (ChromaDB)
+# ─────────────────────────────────────────────────────────────────────────────────
+memory:
+  # Enable persistent memory
+  enabled: true
+  
+  # ChromaDB persistence directory
+  persist_dir: "./memory_db"
+  
+  # Collection name for this agent
+  collection_name: "vchat_memory"
+  
+  # Number of relevant memories to retrieve per query
+  top_k: 5
+  
+  # Minimum similarity score to include memory (0.0-1.0)
+  # Lower = more memories retrieved, Higher = stricter matching
+  min_similarity: 0.35
+  
+  # Store user messages in memory
+  store_user_messages: true
+  
+  # Store assistant responses in memory
+  store_assistant_messages: false
+  
+  # Memory categories
+  categories:
+    - "personal"      # User's personal info (name, preferences)
+    - "facts"         # Facts user has shared
+    - "preferences"   # User preferences
+    - "context"       # Conversation context
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Logging Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+

@@ -1,6 +1,6 @@
-# VChat - Voice Chat with AI
+# VChat - AI Voice Assistant
 
-Real-time voice chat with AI-powered responses using LiveKit.
+Real-time voice chat with AI using LiveKit WebRTC.
 
 ## Architecture
 
@@ -17,185 +17,194 @@ Real-time voice chat with AI-powered responses using LiveKit.
                                                     │  STT (Whisper)  │
                                                     │  LLM (Ollama)   │
                                                     │  TTS (Kokoro)   │
+                                                    │  Vision (Qwen)  │
+                                                    │  Memory (Chroma)│
                                                     └─────────────────┘
 ```
 
 ## Features
 
-- **LiveKit-based WebRTC** - Scalable, low-latency audio streaming
-- **Voice Activity Detection** - Silero VAD for smart speech detection
-- **Speech-to-Text** - Local Whisper models (no API keys needed)
-- **LLM Processing** - Ollama for local AI inference
-- **Text-to-Speech** - Kokoro for natural voice synthesis
-- **Barge-in Support** - Interrupt the AI mid-speech
+- **LiveKit WebRTC** - Low-latency audio streaming
+- **Speech-to-Text** - Local Whisper models
+- **LLM** - Ollama for local AI inference
+- **Text-to-Speech** - Kokoro for natural voice
+- **Vision** - Say "what do you see" for camera-based image analysis
+- **Memory** - ChromaDB for persistent conversation context
+- **Barge-in** - Interrupt the AI mid-speech
+- **YAML Config** - Easy customization via `config.yml`
+
+## Files
+
+```
+VChat/
+├── livekit_agent.py      # AI voice agent (server)
+├── livekit_client.py     # Audio client
+├── config.yml            # Configuration
+├── requirements-server.txt   # Server dependencies
+├── requirements-client.txt   # Client dependencies
+├── env.example           # Environment template
+└── README.md
+```
 
 ## Quick Start
 
 ### 1. Install LiveKit Server
 
 ```bash
-# Linux/macOS
 curl -sSL https://get.livekit.io | bash
-
-# Or via Homebrew (macOS)
-brew install livekit
 ```
 
 ### 2. Install Dependencies
 
+**Server (AI Agent):**
 ```bash
-# System dependencies (Linux)
-sudo apt-get install libavdevice-dev libavfilter-dev portaudio19-dev
+pip install -r requirements-server.txt
 
-# Python dependencies
-pip install -r requirements-livekit.txt
+# Linux system dependencies
+sudo apt-get install libavdevice-dev libavfilter-dev portaudio19-dev
 ```
 
-### 3. Configure Environment
+**Client (Audio only):**
+```bash
+pip install -r requirements-client.txt
+```
+
+### 3. Install Ollama Models
+
+```bash
+# Text model
+ollama pull qwen2.5:0.5b
+
+# Vision model (for "what do you see" feature)
+ollama pull qwen3-vl:2b-instruct-bf16
+```
+
+### 4. Configure
 
 ```bash
 cp env.example .env
-# Edit .env with your settings
+# Edit .env with your LiveKit credentials
 ```
 
-### 4. Start Services
+### 5. Run
 
 ```bash
-# Terminal 1: Start LiveKit server (development mode)
+# Terminal 1: LiveKit Server
 livekit-server --dev
 
-# Terminal 2: Start Ollama (if not already running)
+# Terminal 2: Ollama
 ollama serve
 
-# Terminal 3: Start the AI agent
-python livekit_agent.py dev
+# Terminal 3: AI Agent
+python livekit_agent.py --room vchat-room
 
-# Terminal 4: Start the client
+# Terminal 4: Client
 python livekit_client.py --room vchat-room
 ```
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `livekit_agent.py` | AI voice agent with STT/LLM/TTS pipeline |
-| `livekit_client.py` | Client for audio streaming to LiveKit |
-| `requirements-livekit.txt` | Dependencies for LiveKit version |
-| `env.example` | Environment configuration template |
-
-### Legacy Files (WebRTC without LiveKit)
-
-| File | Description |
-|------|-------------|
-| `signaling_server.py` | Simple SDP signaling server |
-| `client.py` | Direct WebRTC audio client |
-| `smart_server.py` | AI server (direct WebRTC) |
-| `requirements.txt` | Dependencies for legacy version |
-
 ## Configuration
 
-### Environment Variables
+Edit `config.yml` to customize:
 
-```bash
-# LiveKit Server
-LIVEKIT_URL=ws://localhost:7880
-LIVEKIT_API_KEY=devkey
-LIVEKIT_API_SECRET=secret
-
-# AI Models
-WHISPER_MODEL=small          # tiny, base, small, medium, large
-OLLAMA_MODEL=qwen2.5:0.5b    # Any Ollama model
-KOKORO_VOICE=af_heart        # Kokoro voice ID
+### System Prompt
+```yaml
+system:
+  prompt: |
+    You are a helpful voice assistant. Keep responses SHORT.
+  greeting: "Hello! How can I help?"
 ```
 
-### Model Options
+### Models
+```yaml
+llm:
+  text_model: "qwen2.5:0.5b"      # Fast text model
+  vision_model: "qwen3-vl:2b-instruct-bf16"  # Vision model
+  
+stt:
+  model: "small"  # Whisper: tiny, base, small, medium, large
 
-**Whisper STT:**
-- `tiny` - Fastest, lower accuracy
-- `base` - Good balance
-- `small` - Recommended
-- `medium` - Better accuracy, slower
-- `large` - Best accuracy, slowest
-
-**Ollama LLM:**
-- `qwen2.5:0.5b` - Fast, lightweight
-- `llama3.2:1b` - Good quality
-- `mistral:7b` - High quality
-
-## Usage Examples
-
-### Client Options
-
-```bash
-# Connect to default room
-python livekit_client.py
-
-# Specify room name
-python livekit_client.py --room my-room
-
-# Connect to remote server
-python livekit_client.py --url wss://my-server.livekit.cloud
+tts:
+  voice: "am_puck"  # Kokoro voice
 ```
 
-### Agent Options
-
-```bash
-# Development mode (auto-creates room)
-python livekit_agent.py dev
-
-# Production mode
-python livekit_agent.py connect
+### Memory
+```yaml
+memory:
+  enabled: true
+  top_k: 5           # Memories to retrieve
+  min_similarity: 0.35
 ```
 
-## LiveKit Cloud Deployment
+### Vision Triggers
+```yaml
+system:
+  vision_triggers:
+    - "what do you see"
+    - "describe what you see"
+    - "look at this"
+```
 
-For production, use [LiveKit Cloud](https://cloud.livekit.io):
+## Usage
 
-1. Create a project at cloud.livekit.io
-2. Get your API key and secret
-3. Update `.env`:
-   ```bash
-   LIVEKIT_URL=wss://your-project.livekit.cloud
-   LIVEKIT_API_KEY=your-api-key
-   LIVEKIT_API_SECRET=your-api-secret
-   ```
+### Voice Commands
+
+| Say | Action |
+|-----|--------|
+| "What do you see?" | Captures camera and describes |
+| "My name is X" | Saves to memory |
+| "What's my name?" | Recalls from memory |
+| (Speak while AI talks) | Interrupts AI (barge-in) |
+
+### Command Line
+
+```bash
+# Agent with custom room
+python livekit_agent.py --room my-room
+
+# Agent with custom config
+python livekit_agent.py --config custom.yml
+
+# Client options
+python livekit_client.py --room my-room --identity user1
+```
 
 ## Troubleshooting
 
-### No audio input
+### No audio
 ```bash
-# Check if microphone is available
+# Test microphone
 python -c "import pyaudio; p = pyaudio.PyAudio(); print(p.get_default_input_device_info())"
 ```
 
-### Ollama connection error
+### Ollama not responding
 ```bash
-# Ensure Ollama is running
-ollama serve
+# Check if running
+curl http://localhost:11434/api/tags
 
-# Pull the model
-ollama pull qwen2.5:0.5b
+# Restart if stuck
+sudo systemctl restart ollama
 ```
 
-### CUDA issues
+### Vision not working
 ```bash
-# Check PyTorch CUDA
-python -c "import torch; print(torch.cuda.is_available())"
+# Test camera
+python -c "import cv2; cap = cv2.VideoCapture(0); print('Camera OK' if cap.isOpened() else 'No camera')"
+
+# Check vision model
+ollama run qwen3-vl:2b-instruct-bf16 "describe this image"
 ```
 
-## Development
-
-### Running Tests
-
+### Memory not finding info
 ```bash
-# Test audio devices
-python -c "import pyaudio; p = pyaudio.PyAudio(); print([p.get_device_info_by_index(i) for i in range(p.get_device_count())])"
-
-# Test Whisper
-python -c "import whisper; m = whisper.load_model('tiny'); print('Whisper OK')"
-
-# Test Kokoro
-python -c "from kokoro import KPipeline; p = KPipeline(lang_code='en-us'); print('Kokoro OK')"
+# Check stored memories
+python -c "
+import chromadb
+client = chromadb.PersistentClient(path='./memory_db')
+col = client.get_or_create_collection('vchat_memory')
+print(f'Memories: {col.count()}')
+for doc in col.get()['documents'][:5]:
+    print(f'  - {doc[:60]}')
+"
 ```
 
 ## License

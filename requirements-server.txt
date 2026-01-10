@@ -1,5 +1,7 @@
-# LiveKit VChat Requirements
-# For AI voice agent with STT + LLM + TTS
+# VChat Server Requirements
+# AI Voice Agent with STT + LLM + TTS + Vision + Memory
+#
+# Install: pip install -r requirements-server.txt
 
 # ============================================================
 # LiveKit SDK
@@ -7,31 +9,38 @@
 livekit>=0.13.0
 
 # ============================================================
-# Audio I/O
-# ============================================================
-pyaudio>=0.2.14
-numpy>=1.24.0
-
-# ============================================================
-# STT - Whisper (Local)
+# STT - Whisper (Local Speech-to-Text)
 # ============================================================
 openai-whisper>=20231117
 torch>=2.0.0
 scipy>=1.11.0
 
 # ============================================================
-# TTS - Kokoro (Local)
+# TTS - Kokoro (Local Text-to-Speech)
 # ============================================================
 kokoro>=0.9.0
 huggingface-hub>=0.20.0
 torchaudio>=2.0.0
 
 # ============================================================
-# LLM - Ollama (via HTTP)
+# LLM - Ollama (via HTTP, no extra deps)
 # ============================================================
 aiohttp>=3.9.0
 
 # ============================================================
+# Vision (Camera capture for image analysis)
+# ============================================================
+opencv-python>=4.8.0
+
+# ============================================================
+# Memory (ChromaDB for persistent context)
+# ============================================================
+chromadb>=0.4.0
+
+# ============================================================
 # Utilities
 # ============================================================
+numpy>=1.24.0
 python-dotenv>=1.0.0
+PyYAML>=6.0
+
