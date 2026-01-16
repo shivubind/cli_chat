@@ -29,7 +29,7 @@ load_dotenv()
 # Configuration
 # ============================================================
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://192.168.0.125:7880")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
 
@@ -452,6 +452,7 @@ def create_token(room_name: str, identity: str) -> str:
     import base64
     import hmac
     import hashlib
+    import time
     
     token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     token.with_identity(identity)
@@ -467,7 +468,7 @@ def create_token(room_name: str, identity: str) -> str:
     # Generate initial JWT
     jwt_token = token.to_jwt()
     
-    # Decode and modify nbf to subtract 10 seconds for clock skew compensation
+    # Decode and modify nbf to subtract 30 seconds for clock skew compensation
     try:
         # Decode without verification to modify the claims
         parts = jwt_token.split('.')
@@ -479,9 +480,9 @@ def create_token(room_name: str, identity: str) -> str:
         
         decoded_payload = json.loads(base64.urlsafe_b64decode(payload))
         
-        # Subtract 10 seconds from nbf to account for clock skew
+        # Subtract 30 seconds from nbf to account for clock skew
         if 'nbf' in decoded_payload:
-            decoded_payload['nbf'] -= 10
+            decoded_payload['nbf'] -= 30
         
         # Re-encode
         modified_payload = base64.urlsafe_b64encode(

@@ -1149,7 +1149,7 @@ class VoiceAgent:
             import hmac
             import hashlib
             
-            # Decode and modify nbf to subtract 10 seconds for clock skew compensation
+            # Decode and modify nbf to subtract 30 seconds for clock skew compensation
             parts = jwt_token.split('.')
             payload = parts[1]
             # Add padding if needed
@@ -1159,9 +1159,9 @@ class VoiceAgent:
             
             decoded_payload = json.loads(base64.urlsafe_b64decode(payload))
             
-            # Subtract 10 seconds from nbf to account for clock skew
+            # Subtract 30 seconds from nbf to account for clock skew
             if 'nbf' in decoded_payload:
-                decoded_payload['nbf'] -= 10
+                decoded_payload['nbf'] -= 30
             
             # Re-encode
             modified_payload = base64.urlsafe_b64encode(
