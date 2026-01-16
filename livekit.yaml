@@ -1,21 +1,18 @@
-# ═══════════════════════════════════════════════════════════════════════════════
 # LiveKit Server Configuration
 # Start with: livekit-server --config livekit.yaml --dev
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# Bind to all interfaces (required for remote clients)
+bind_addresses:
+  - "0.0.0.0"
 
 # Server port
 port: 7880
 
 # WebRTC configuration
 rtc:
-  # Port range for media (UDP)
   port_range_start: 50000
   port_range_end: 60000
-  
-  # Use external IP for remote clients
   use_external_ip: true
-  
-  # TCP fallback if UDP is blocked
   tcp_port: 7881
 
 # API keys (client must use matching key/secret)
@@ -25,17 +22,8 @@ keys:
 # Logging
 logging:
   level: info
-  # json: true  # Enable for production
 
 # Room settings
 room:
-  # Auto-create rooms
   auto_create: true
-  
-  # Empty room timeout (seconds)
   empty_timeout: 300
-
-# Optional: Redis for multi-node deployment
-# redis:
-#   address: localhost:6379
-
