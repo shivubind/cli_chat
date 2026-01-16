@@ -144,8 +144,8 @@ vision:
   width: 640
   height: 480
   
-  # Vision prompt template (short for fast response)
-  prompt: "Describe briefly what you see in 1-2 sentences."
+  # Vision prompt template (must be a question for moondream)
+  prompt: "What do you see in this image?"
   
   # Save captured images for debugging (check ./captures folder)
   save_captures: true

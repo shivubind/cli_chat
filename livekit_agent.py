@@ -564,34 +564,42 @@ class OllamaLLM:
                     }
                 }
                 
-                async with session.post(
-                    f"{self.base_url}/api/generate",
-                    json=request_data
-                ) as resp:
-                    logger.info(f"📡 Vision API response: {resp.status}")
-                    
-                    if resp.status == 200:
-                        data = await resp.json()
-                        response = data.get("response", "").strip()
+                # Try up to 2 times if empty response
+                for attempt in range(2):
+                    async with session.post(
+                        f"{self.base_url}/api/generate",
+                        json=request_data
+                    ) as resp:
+                        logger.info(f"📡 Vision API response: {resp.status} (attempt {attempt + 1})")
                         
-                        if not response:
-                            logger.warning("⚠️ Vision model returned empty response")
-                            return "I can see the image but couldn't describe it."
-                        
-                        logger.info(f"✓ Vision response: {response[:100]}...")
-                        
-                        self.conversation_history.append({"role": "user", "content": f"[Showed image] {text}"})
-                        self.conversation_history.append({"role": "assistant", "content": response})
-                        return response
-                    else:
-                        error_text = await resp.text()
-                        logger.error(f"❌ Vision model error: {resp.status}")
-                        logger.error(f"   Response: {error_text[:200]}")
-                        
-                        if "not found" in error_text.lower():
-                            return f"Vision model '{self.vision_model}' not found. Run: ollama pull {self.vision_model}"
-                        
-                        return "Sorry, I couldn't analyze the image."
+                        if resp.status == 200:
+                            data = await resp.json()
+                            response = data.get("response", "").strip()
+                            
+                            if not response:
+                                if attempt == 0:
+                                    logger.warning("⚠️ Empty response, retrying...")
+                                    await asyncio.sleep(0.5)
+                                    continue
+                                logger.warning("⚠️ Vision model returned empty response")
+                                return "I can see something but couldn't describe it clearly. Try asking again."
+                            
+                            logger.info(f"✓ Vision response: {response[:100]}...")
+                            
+                            self.conversation_history.append({"role": "user", "content": f"[Showed image] {text}"})
+                            self.conversation_history.append({"role": "assistant", "content": response})
+                            return response
+                        else:
+                            error_text = await resp.text()
+                            logger.error(f"❌ Vision model error: {resp.status}")
+                            logger.error(f"   Response: {error_text[:200]}")
+                            
+                            if "not found" in error_text.lower():
+                                return f"Vision model '{self.vision_model}' not found. Run: ollama pull {self.vision_model}"
+                            
+                            return "Sorry, I couldn't analyze the image."
+                
+                return "I couldn't describe what I see. Try again."
                         
         except asyncio.TimeoutError:
             logger.error("⏱️ Vision request timed out (30s)")
@@ -1006,8 +1014,8 @@ class AudioProcessor:
         # Prefer client video if available and configured
         if config.use_client_camera and self.client_video.has_video():
             logger.info("📷 Using client camera for vision")
-            # Use small image (256px) for fast CPU processing
-            image = self.client_video.capture_as_base64(self.current_participant, max_size=256)
+            # Use 384px for good balance of speed and quality
+            image = self.client_video.capture_as_base64(self.current_participant, max_size=384)
             if image:
                 return image
             logger.warning("⚠️ Client video available but capture failed")
