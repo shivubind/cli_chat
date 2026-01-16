@@ -241,7 +241,7 @@ class LiveKitClient:
         self.running = False
         
     async def connect(self):
-        """Connect to LiveKit room"""
+        """Connect to LiveKit room with retry logic"""
         print(f"🔗 Connecting to room: {self.room_name}")
         print(f"   URL: {self.url}")
         
@@ -273,11 +273,37 @@ class LiveKitClient:
         def on_connection_state(state: rtc.ConnectionState):
             print(f"📡 Connection state: {state}")
         
-        # Connect to room
-        await self.room.connect(self.url, self.token)
-        print(f"✓ Connected to room: {self.room.name}")
+        # Connect to room with retry logic
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                await asyncio.wait_for(
+                    self.room.connect(self.url, self.token),
+                    timeout=30.0
+                )
+                print(f"✓ Connected to room: {self.room.name}")
+                break
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    print(f"⚠️  Connection timeout (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 10)  # Exponential backoff, max 10s
+                else:
+                    print(f"❌ Failed to connect after {max_retries} attempts")
+                    raise
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠️  Connection error: {e} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 10)
+                else:
+                    print(f"❌ Connection failed after {max_retries} attempts: {e}")
+                    raise
         
         # Print existing participants
+
         for participant in self.room.remote_participants.values():
             print(f"👤 Existing participant: {participant.identity}")
         

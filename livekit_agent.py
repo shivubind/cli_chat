@@ -1227,8 +1227,35 @@ class VoiceAgent:
         local_track = rtc.LocalAudioTrack.create_audio_track("agent-voice", self.audio_source)
         
         options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-        await self.room.local_participant.publish_track(local_track, options)
-        logger.info("✓ Audio track published")
+        
+        # Publish track with error handling
+        try:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    publication = await asyncio.wait_for(
+                        self.room.local_participant.publish_track(local_track, options),
+                        timeout=15.0
+                    )
+                    logger.info("✓ Audio track published")
+                    # Wait a bit for track to be ready before sending audio
+                    await asyncio.sleep(0.5)
+                    break
+                except asyncio.TimeoutError:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Publish timeout (attempt {attempt + 1}/{max_retries}), retrying...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Publish error: {e} (attempt {attempt + 1}/{max_retries}), retrying...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+        except Exception as e:
+            logger.error(f"❌ Failed to publish audio track: {e}")
+            raise
         
         # Print info
         logger.info("═" * 50)
@@ -1310,54 +1337,74 @@ class VoiceAgent:
     async def _say(self, text: str):
         """Say something using TTS"""
         logger.info(f"🔊 Saying: {text}")
-        audio = self.processor.tts.synthesize(text)
-        if audio is not None:
-            logger.info(f"📢 Sending {len(audio)/config.tts_sample_rate:.1f}s of audio...")
-            self.processor.tts_playing = True
-            await self._send_audio(audio, config.tts_sample_rate)
+        try:
+            audio = self.processor.tts.synthesize(text)
+            if audio is not None:
+                logger.info(f"📢 Sending {len(audio)/config.tts_sample_rate:.1f}s of audio...")
+                self.processor.tts_playing = True
+                await self._send_audio(audio, config.tts_sample_rate)
+                self.processor.tts_playing = False
+                logger.info("✓ Audio sent")
+            else:
+                logger.error("❌ TTS returned no audio")
+        except Exception as e:
+            logger.error(f"❌ Error in _say: {e}")
             self.processor.tts_playing = False
-            logger.info("✓ Audio sent")
-        else:
-            logger.error("❌ TTS returned no audio")
     
     async def _send_audio(self, audio: np.ndarray, source_rate: int):
-        """Send audio through LiveKit"""
+        """Send audio through LiveKit with error handling"""
         from scipy import signal
         
-        # Convert to float for resampling
-        audio_float = audio.astype(np.float32)
-        
-        # Resample to output sample rate if needed
-        if source_rate != config.sample_rate:
-            num_samples = int(len(audio_float) * config.sample_rate / source_rate)
-            audio_float = signal.resample(audio_float, num_samples)
-        
-        # Convert back to int16 with proper clipping
-        audio_int16 = np.clip(audio_float, -32768, 32767).astype(np.int16)
-        
-        # Send in chunks
-        chunk_size = config.chunk_size
-        total_chunks = (len(audio_int16) + chunk_size - 1) // chunk_size
-        
-        for i in range(0, len(audio_int16), chunk_size):
-            if not self.running:
-                break
+        try:
+            # Convert to float for resampling
+            audio_float = audio.astype(np.float32)
             
-            chunk = audio_int16[i:i+chunk_size]
+            # Resample to output sample rate if needed
+            if source_rate != config.sample_rate:
+                num_samples = int(len(audio_float) * config.sample_rate / source_rate)
+                audio_float = signal.resample(audio_float, num_samples)
             
-            # Pad if needed
-            if len(chunk) < chunk_size:
-                chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+            # Convert back to int16 with proper clipping
+            audio_int16 = np.clip(audio_float, -32768, 32767).astype(np.int16)
             
-            # Create frame and copy data
-            frame = rtc.AudioFrame.create(config.sample_rate, config.channels, chunk_size)
-            frame_data = np.frombuffer(frame.data, dtype=np.int16)
-            np.copyto(frame_data, chunk)
+            # Send in chunks
+            chunk_size = config.chunk_size
+            total_chunks = (len(audio_int16) + chunk_size - 1) // chunk_size
             
-            await self.audio_source.capture_frame(frame)
-            
-            # Wait for real-time playback (20ms per chunk at 48kHz)
-            await asyncio.sleep(0.019)
+            for i in range(0, len(audio_int16), chunk_size):
+                if not self.running:
+                    break
+                
+                chunk = audio_int16[i:i+chunk_size]
+                
+                # Pad if needed
+                if len(chunk) < chunk_size:
+                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                
+                try:
+                    # Create frame and copy data
+                    frame = rtc.AudioFrame.create(config.sample_rate, config.channels, chunk_size)
+                    frame_data = np.frombuffer(frame.data, dtype=np.int16)
+                    np.copyto(frame_data, chunk)
+                    
+                    # Capture frame with error handling
+                    await self.audio_source.capture_frame(frame)
+                    
+                    # Wait for real-time playback (20ms per chunk at 48kHz)
+                    await asyncio.sleep(0.019)
+                except Exception as frame_error:
+                    # Log and skip this frame instead of crashing
+                    if "InvalidState" in str(frame_error) or "failed to capture" in str(frame_error):
+                        logger.debug(f"Frame capture skipped: {frame_error}")
+                        # Small delay before retrying next frame
+                        await asyncio.sleep(0.05)
+                    else:
+                        logger.error(f"Error sending audio frame: {frame_error}")
+                        raise
+        except Exception as e:
+            logger.error(f"❌ Error in _send_audio: {e}")
+            # Don't raise - let the TTS continue even if audio send fails
+
     
     async def run(self):
         """Run the agent"""
