@@ -2,10 +2,11 @@
 """
 LiveKit AI Voice Agent with Vision & Memory
 - Receives audio from LiveKit room participants
+- Receives video from clients for vision analysis
 - Transcribes with Whisper STT (local)
 - Generates response with Ollama LLM
 - Sends TTS response back via LiveKit
-- Vision: Can describe what camera sees on request
+- Vision: Can describe what client's camera sees on request
 - Memory: ChromaDB for persistent conversation memory
 
 Usage:
@@ -19,8 +20,10 @@ import os
 import logging
 import base64
 import uuid
+import threading
 from pathlib import Path
 from datetime import datetime
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -194,7 +197,7 @@ class Config:
     def vad_min_speech_duration(self):
         return self.get("audio", "vad", "min_speech_duration", default=0.5)
     
-    # Vision
+    # Vision (now primarily for client video)
     @property
     def vision_enabled(self):
         return self.get("vision", "enabled", default=True)
@@ -222,6 +225,11 @@ class Config:
     @property
     def captures_dir(self):
         return self.get("vision", "captures_dir", default="./captures")
+    
+    @property
+    def use_client_camera(self):
+        """Prefer client's camera over server camera"""
+        return self.get("vision", "use_client_camera", default=True)
     
     # Memory (ChromaDB)
     @property
@@ -536,8 +544,8 @@ class OllamaLLM:
     
     async def generate_with_vision(self, text: str, image_base64: str) -> str:
         """Generate response with image analysis"""
-        # 30 second timeout for vision (it can be slow)
-        timeout = aiohttp.ClientTimeout(total=30)
+        # 45 second timeout for vision (moondream is faster)
+        timeout = aiohttp.ClientTimeout(total=45)
         
         logger.info(f"🔍 Sending image to {self.vision_model}...")
         logger.info(f"   Image size: {len(image_base64)} bytes")
@@ -651,11 +659,139 @@ class KokoroTTS:
 
 
 # ============================================================
-# Vision (Camera Capture)
+# Client Video Receiver (receives video from clients)
+# ============================================================
+
+class ClientVideoReceiver:
+    """Receives and stores video frames from client participants"""
+    
+    def __init__(self):
+        self.enabled = config.vision_enabled
+        self.participant_frames = defaultdict(lambda: None)  # participant_id -> latest frame
+        self._locks = defaultdict(threading.Lock)
+        self.cv2 = None
+        
+        # Try to load OpenCV for image encoding
+        try:
+            import cv2
+            self.cv2 = cv2
+            logger.info("✓ OpenCV loaded for client video processing")
+        except ImportError:
+            logger.warning("OpenCV not available for video processing")
+    
+    def store_frame(self, participant_id: str, frame_data: bytes, width: int, height: int, format_type: str = "RGBA"):
+        """Store a video frame from a participant"""
+        if not self.enabled or self.cv2 is None:
+            return
+        
+        try:
+            # Convert bytes to numpy array based on format
+            if format_type == "RGBA":
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 4))
+                # Convert RGBA to BGR for OpenCV
+                frame_bgr = self.cv2.cvtColor(frame, self.cv2.COLOR_RGBA2BGR)
+            elif format_type == "RGB":
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
+                frame_bgr = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
+            elif format_type == "I420":
+                # YUV I420 format
+                frame_yuv = np.frombuffer(frame_data, dtype=np.uint8).reshape((height * 3 // 2, width))
+                frame_bgr = self.cv2.cvtColor(frame_yuv, self.cv2.COLOR_YUV2BGR_I420)
+            else:
+                # Assume BGR
+                frame_bgr = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
+            
+            with self._locks[participant_id]:
+                self.participant_frames[participant_id] = frame_bgr.copy()
+                
+        except Exception as e:
+            logger.error(f"Error storing frame from {participant_id}: {e}")
+    
+    def get_latest_frame(self, participant_id: str = None) -> np.ndarray | None:
+        """Get the latest frame from a participant or any available frame"""
+        if not self.enabled:
+            return None
+        
+        if participant_id and participant_id in self.participant_frames:
+            with self._locks[participant_id]:
+                frame = self.participant_frames[participant_id]
+                return frame.copy() if frame is not None else None
+        
+        # If no specific participant, get any available frame
+        for pid, frame in self.participant_frames.items():
+            if frame is not None:
+                with self._locks[pid]:
+                    return frame.copy()
+        
+        return None
+    
+    def capture_as_base64(self, participant_id: str = None, max_size: int = 320) -> str | None:
+        """Capture latest frame and return as base64 JPEG (resized for fast processing)"""
+        if not self.enabled or self.cv2 is None:
+            return None
+        
+        frame = self.get_latest_frame(participant_id)
+        
+        if frame is None:
+            logger.warning("No frame available from any client")
+            return None
+        
+        try:
+            # Resize for faster vision processing (smaller = faster)
+            h, w = frame.shape[:2]
+            if max(h, w) > max_size:
+                scale = max_size / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                frame = self.cv2.resize(frame, (new_w, new_h), interpolation=self.cv2.INTER_AREA)
+                logger.info(f"📐 Resized frame: {w}x{h} → {new_w}x{new_h}")
+            
+            # Save if configured
+            if config.save_captures:
+                captures_dir = Path(config.captures_dir)
+                captures_dir.mkdir(exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_path = captures_dir / f"client_capture_{timestamp}.jpg"
+                self.cv2.imwrite(str(save_path), frame)
+                logger.info(f"💾 Saved client capture to {save_path}")
+            
+            # Encode to JPEG with lower quality for speed
+            encode_params = [self.cv2.IMWRITE_JPEG_QUALITY, 70]
+            success, buffer = self.cv2.imencode('.jpg', frame, encode_params)
+            
+            if not success:
+                logger.error("Failed to encode frame to JPEG")
+                return None
+            
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
+            logger.info(f"✓ Client frame captured and encoded: {len(image_base64)} bytes")
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error capturing frame as base64: {e}")
+            return None
+    
+    def has_video(self, participant_id: str = None) -> bool:
+        """Check if we have video from a participant"""
+        if participant_id:
+            return self.participant_frames.get(participant_id) is not None
+        return any(f is not None for f in self.participant_frames.values())
+    
+    def remove_participant(self, participant_id: str):
+        """Remove frames for a disconnected participant"""
+        if participant_id in self.participant_frames:
+            del self.participant_frames[participant_id]
+            if participant_id in self._locks:
+                del self._locks[participant_id]
+            logger.info(f"🧹 Removed video data for {participant_id}")
+
+
+# ============================================================
+# Vision (Server Camera Capture - Fallback)
 # ============================================================
 
 class VisionCapture:
-    """Camera capture for vision capabilities"""
+    """Server camera capture for vision capabilities (fallback if no client video)"""
     
     def __init__(self, auto_init: bool = False):
         self.enabled = config.vision_enabled
@@ -679,12 +815,11 @@ class VisionCapture:
             import cv2
             self.cv2 = cv2
             
-            logger.info(f"📷 Opening camera {self.camera_index}...")
+            logger.info(f"📷 Opening server camera {self.camera_index}...")
             self.camera = cv2.VideoCapture(self.camera_index)
             
             if not self.camera.isOpened():
-                logger.error(f"❌ Could not open camera {self.camera_index}")
-                self.enabled = False
+                logger.warning(f"⚠️ Could not open server camera {self.camera_index}")
                 return False
             
             # Set resolution
@@ -699,22 +834,19 @@ class VisionCapture:
             actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            logger.info(f"✓ Camera ready: {actual_w}x{actual_h}")
+            logger.info(f"✓ Server camera ready: {actual_w}x{actual_h}")
             return True
             
         except ImportError:
-            logger.error("❌ OpenCV (cv2) not installed. Run: pip install opencv-python")
-            self.enabled = False
+            logger.warning("⚠️ OpenCV (cv2) not installed for server camera")
             return False
         except Exception as e:
-            logger.error(f"❌ Camera initialization failed: {e}")
-            self.enabled = False
+            logger.warning(f"⚠️ Server camera initialization failed: {e}")
             return False
     
     def capture(self) -> str | None:
         """Capture image and return as base64"""
         if not self.enabled:
-            logger.warning("Vision capture called but vision is disabled")
             return None
         
         # Initialize if not already done
@@ -723,44 +855,40 @@ class VisionCapture:
                 return None
         
         if not self.camera.isOpened():
-            logger.error("Camera is not opened")
             return None
         
         try:
             # Capture frame
             ret, frame = self.camera.read()
             if not ret or frame is None:
-                logger.error("Failed to capture frame from camera")
+                logger.error("Failed to capture frame from server camera")
                 return None
             
-            logger.info(f"📸 Captured frame: {frame.shape[1]}x{frame.shape[0]}")
+            logger.info(f"📸 Captured from server camera: {frame.shape[1]}x{frame.shape[0]}")
             
             # Save if configured
             if config.save_captures:
                 captures_dir = Path(config.captures_dir)
                 captures_dir.mkdir(exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = captures_dir / f"capture_{timestamp}.jpg"
+                save_path = captures_dir / f"server_capture_{timestamp}.jpg"
                 self.cv2.imwrite(str(save_path), frame)
-                logger.info(f"💾 Saved capture to {save_path}")
+                logger.info(f"💾 Saved server capture to {save_path}")
             
             # Encode to base64
             encode_params = [self.cv2.IMWRITE_JPEG_QUALITY, 85]
             success, buffer = self.cv2.imencode('.jpg', frame, encode_params)
             
             if not success:
-                logger.error("Failed to encode image to JPEG")
                 return None
             
             image_base64 = base64.b64encode(buffer).decode('utf-8')
-            logger.info(f"✓ Image encoded: {len(image_base64)} bytes")
+            logger.info(f"✓ Server image encoded: {len(image_base64)} bytes")
             
             return image_base64
             
         except Exception as e:
-            logger.error(f"Capture error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Server capture error: {e}")
             return None
     
     def release(self):
@@ -768,7 +896,7 @@ class VisionCapture:
         if self.camera is not None:
             self.camera.release()
             self.camera = None
-            logger.info("📷 Camera released")
+            logger.info("📷 Server camera released")
 
 
 # ============================================================
@@ -839,7 +967,7 @@ class SimpleVAD:
 class AudioProcessor:
     """Processes audio: STT → LLM → TTS (with Vision & Memory support)"""
     
-    def __init__(self):
+    def __init__(self, client_video_receiver: ClientVideoReceiver = None):
         logger.info("Initializing AudioProcessor...")
         
         self.memory = Memory()
@@ -848,12 +976,18 @@ class AudioProcessor:
         self.tts = KokoroTTS()
         self.vad = SimpleVAD()
         
-        # Initialize camera early so it's ready for vision requests
-        self.vision = VisionCapture(auto_init=True)
+        # Client video receiver (primary vision source)
+        self.client_video = client_video_receiver or ClientVideoReceiver()
+        
+        # Server camera as fallback
+        self.server_camera = VisionCapture(auto_init=False)
         
         self.audio_buffer = []
         self.is_processing = False
         self.tts_playing = False
+        
+        # Track current speaking participant for vision
+        self.current_participant = None
         
         logger.info("✓ AudioProcessor ready")
     
@@ -867,8 +1001,28 @@ class AudioProcessor:
         logger.debug(f"No vision trigger in: '{text}'")
         return False
     
-    def add_audio(self, audio: np.ndarray, sample_rate: int) -> bool:
+    def _get_vision_image(self) -> str | None:
+        """Get image from client video or fallback to server camera"""
+        # Prefer client video if available and configured
+        if config.use_client_camera and self.client_video.has_video():
+            logger.info("📷 Using client camera for vision")
+            # Use small image (256px) for fast CPU processing
+            image = self.client_video.capture_as_base64(self.current_participant, max_size=256)
+            if image:
+                return image
+            logger.warning("⚠️ Client video available but capture failed")
+        
+        # Fallback to server camera
+        logger.info("📷 Falling back to server camera for vision")
+        if not self.server_camera.camera:
+            self.server_camera.init_camera()
+        return self.server_camera.capture()
+    
+    def add_audio(self, audio: np.ndarray, sample_rate: int, participant_id: str = None) -> bool:
         """Add audio chunk, return True if ready to process"""
+        # Track who is speaking for vision targeting
+        self.current_participant = participant_id
+        
         # Check for barge-in
         if self.tts_playing:
             if self.vad.is_barge_in(audio):
@@ -914,13 +1068,13 @@ class AudioProcessor:
             # Check for vision trigger
             if self._check_vision_trigger(text):
                 logger.info("👁️ Vision request detected")
-                image_base64 = self.vision.capture()
+                image_base64 = self._get_vision_image()
                 
                 if image_base64:
                     logger.info("🤖 Analyzing image...")
                     response = await self.llm.generate_with_vision(text, image_base64)
                 else:
-                    response = "Sorry, I couldn't access the camera to see anything."
+                    response = "Sorry, I couldn't access any camera to see anything. Make sure video is enabled on your client."
             else:
                 # Normal text response
                 logger.info("🤖 Thinking...")
@@ -943,7 +1097,7 @@ class AudioProcessor:
     
     def cleanup(self):
         """Cleanup resources"""
-        self.vision.release()
+        self.server_camera.release()
 
 
 # ============================================================
@@ -951,12 +1105,18 @@ class AudioProcessor:
 # ============================================================
 
 class VoiceAgent:
-    """LiveKit Voice Agent with Vision"""
+    """LiveKit Voice Agent with Vision from Client Video"""
     
     def __init__(self, room_name: str = None):
         self.room_name = room_name or config.room_name
         self.room = rtc.Room()
-        self.processor = AudioProcessor()
+        
+        # Create client video receiver first
+        self.client_video = ClientVideoReceiver()
+        
+        # Create processor with client video receiver
+        self.processor = AudioProcessor(client_video_receiver=self.client_video)
+        
         self.audio_source = None
         self.running = False
     
@@ -986,6 +1146,8 @@ class VoiceAgent:
         @self.room.on("participant_disconnected")
         def on_participant_disconnected(participant: rtc.RemoteParticipant):
             logger.info(f"👤 Participant left: {participant.identity}")
+            # Clean up video data for this participant
+            self.client_video.remove_participant(participant.identity)
         
         @self.room.on("track_subscribed")
         def on_track_subscribed(
@@ -996,6 +1158,9 @@ class VoiceAgent:
             if track.kind == rtc.TrackKind.KIND_AUDIO:
                 logger.info(f"🎵 Subscribed to audio from: {participant.identity}")
                 asyncio.create_task(self._handle_audio_track(track, participant))
+            elif track.kind == rtc.TrackKind.KIND_VIDEO:
+                logger.info(f"📹 Subscribed to video from: {participant.identity}")
+                asyncio.create_task(self._handle_video_track(track, participant))
         
         @self.room.on("disconnected")
         def on_disconnected():
@@ -1023,7 +1188,9 @@ class VoiceAgent:
         logger.info(f"  STT: Whisper ({config.whisper_model})")
         logger.info(f"  LLM: Ollama ({config.text_model})")
         logger.info(f"  Vision: {config.vision_model if config.vision_enabled else 'Disabled'}")
+        logger.info(f"  Vision Source: Client Camera (preferred) / Server Fallback")
         logger.info(f"  TTS: Kokoro ({config.tts_voice})")
+        logger.info(f"  Memory: {'ChromaDB' if config.memory_enabled else 'Disabled'}")
         logger.info("═" * 50)
         logger.info("Waiting for participants...")
         
@@ -1046,14 +1213,50 @@ class VoiceAgent:
             # Convert to numpy
             audio_data = np.frombuffer(bytes(frame.data), dtype=np.int16).astype(np.float32) / 32768.0
             
-            # Add to processor
-            if self.processor.add_audio(audio_data, frame.sample_rate):
+            # Add to processor with participant ID for vision targeting
+            if self.processor.add_audio(audio_data, frame.sample_rate, participant.identity):
                 # Process and respond
                 response_audio = await self.processor.process()
                 
                 if response_audio is not None:
                     await self._send_audio(response_audio, config.tts_sample_rate)
                     self.processor.tts_playing = False
+    
+    async def _handle_video_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
+        """Handle incoming video from participant for vision"""
+        logger.info(f"📹 Starting video processing for: {participant.identity}")
+        
+        video_stream = rtc.VideoStream(track)
+        frame_count = 0
+        
+        async for event in video_stream:
+            if not self.running:
+                break
+            
+            frame = event.frame
+            frame_count += 1
+            
+            # Log periodically
+            if frame_count == 1:
+                logger.info(f"📹 Receiving video from {participant.identity}: {frame.width}x{frame.height}")
+            
+            # Get frame data and store it
+            try:
+                # Convert frame to RGBA bytes
+                argb_frame = frame.convert(rtc.VideoBufferType.RGBA)
+                frame_data = bytes(argb_frame.data)
+                
+                self.client_video.store_frame(
+                    participant.identity,
+                    frame_data,
+                    frame.width,
+                    frame.height,
+                    "RGBA"
+                )
+                
+            except Exception as e:
+                if frame_count <= 3:
+                    logger.error(f"Error processing video frame: {e}")
     
     async def _say(self, text: str):
         """Say something using TTS"""
@@ -1139,7 +1342,8 @@ async def main():
     print("  VChat - LiveKit AI Voice Agent")
     print("═" * 50)
     print(f"  Config: {args.config}")
-    print(f"  Vision: {'Enabled' if config.vision_enabled else 'Disabled'}")
+    print(f"  Vision: {'Enabled (Client + Server)' if config.vision_enabled else 'Disabled'}")
+    print(f"  Memory: {'ChromaDB' if config.memory_enabled else 'Disabled'}")
     print("═" * 50)
     
     agent = VoiceAgent(args.room)

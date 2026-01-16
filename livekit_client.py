@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-LiveKit Audio Client
+LiveKit Audio/Video Client with Vision Support
 - Connects to a LiveKit room
 - Captures microphone audio and publishes to room
+- Captures camera video and publishes to room (for AI vision)
 - Plays back audio from other participants (AI agent)
 
 Usage:
   python livekit_client.py                    # Uses env vars for connection
   python livekit_client.py --room my-room     # Specify room name
-  python livekit_client.py --url wss://...    # Specify LiveKit server URL
+  python livekit_client.py --no-video         # Audio only, no camera
 """
 import asyncio
 import argparse
 import os
 import sys
+import threading
 from dotenv import load_dotenv
 
 import numpy as np
@@ -36,6 +38,11 @@ SAMPLE_RATE = 48000
 CHANNELS = 1
 BUFFER_SIZE = 960  # 20ms at 48kHz
 PLAYBACK_BUFFER = 4800  # 100ms buffer
+
+# Video settings
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 480
+VIDEO_FPS = 15  # Lower FPS to reduce bandwidth
 
 
 # ============================================================
@@ -127,21 +134,110 @@ class AudioPlayback:
 
 
 # ============================================================
-# LiveKit Client
+# Video Source (Camera)
+# ============================================================
+
+class CameraSource:
+    """Captures video from camera using OpenCV"""
+    
+    def __init__(self, width: int = VIDEO_WIDTH, height: int = VIDEO_HEIGHT, 
+                 fps: int = VIDEO_FPS, camera_index: int = 0):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.camera_index = camera_index
+        self.camera = None
+        self.running = False
+        self.cv2 = None
+        self.latest_frame = None
+        self._lock = threading.Lock()
+    
+    def start(self) -> bool:
+        """Start video capture"""
+        try:
+            import cv2
+            self.cv2 = cv2
+        except ImportError:
+            print("❌ OpenCV not installed. Run: pip install opencv-python")
+            return False
+        
+        print(f"📷 Opening camera {self.camera_index}...")
+        self.camera = self.cv2.VideoCapture(self.camera_index)
+        
+        if not self.camera.isOpened():
+            print(f"❌ Could not open camera {self.camera_index}")
+            return False
+        
+        # Set camera properties
+        self.camera.set(self.cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.camera.set(self.cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.camera.set(self.cv2.CAP_PROP_FPS, self.fps)
+        
+        # Warm up camera
+        for _ in range(5):
+            self.camera.read()
+        
+        # Get actual resolution
+        actual_w = int(self.camera.get(self.cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.camera.get(self.cv2.CAP_PROP_FRAME_HEIGHT))
+        self.width = actual_w
+        self.height = actual_h
+        
+        self.running = True
+        print(f"📷 Camera started ({actual_w}x{actual_h} @ {self.fps}fps)")
+        return True
+    
+    def read(self) -> np.ndarray | None:
+        """Read a frame from camera (BGR format)"""
+        if not self.camera or not self.running:
+            return None
+        
+        ret, frame = self.camera.read()
+        if not ret or frame is None:
+            return None
+        
+        with self._lock:
+            self.latest_frame = frame.copy()
+        
+        return frame
+    
+    def get_latest_frame(self) -> np.ndarray | None:
+        """Get the most recently captured frame"""
+        with self._lock:
+            return self.latest_frame.copy() if self.latest_frame is not None else None
+    
+    def stop(self):
+        """Stop video capture"""
+        self.running = False
+        if self.camera:
+            self.camera.release()
+            self.camera = None
+        print("📷 Camera stopped")
+
+
+# ============================================================
+# LiveKit Client with Video
 # ============================================================
 
 class LiveKitClient:
-    """LiveKit room client with microphone and speaker"""
+    """LiveKit room client with microphone, speaker, and camera"""
     
-    def __init__(self, url: str, token: str, room_name: str):
+    def __init__(self, url: str, token: str, room_name: str, enable_video: bool = True):
         self.url = url
         self.token = token
         self.room_name = room_name
+        self.enable_video = enable_video
+        
         self.room = rtc.Room()
         self.mic = MicrophoneSource()
         self.speaker = AudioPlayback()
+        self.camera = CameraSource() if enable_video else None
+        
         self.audio_source = None
-        self.local_track = None
+        self.video_source = None
+        self.local_audio_track = None
+        self.local_video_track = None
+        
         self.running = False
         
     async def connect(self):
@@ -221,7 +317,7 @@ class LiveKitClient:
         self.audio_source = rtc.AudioSource(SAMPLE_RATE, CHANNELS)
         
         # Create local audio track
-        self.local_track = rtc.LocalAudioTrack.create_audio_track(
+        self.local_audio_track = rtc.LocalAudioTrack.create_audio_track(
             "microphone", 
             self.audio_source
         )
@@ -231,7 +327,7 @@ class LiveKitClient:
             source=rtc.TrackSource.SOURCE_MICROPHONE,
         )
         publication = await self.room.local_participant.publish_track(
-            self.local_track, 
+            self.local_audio_track, 
             options
         )
         print(f"✓ Microphone published: {publication.sid}")
@@ -260,18 +356,88 @@ class LiveKitClient:
                     # Capture frame to source
                     await self.audio_source.capture_frame(frame)
                     
+            except KeyboardInterrupt:
+                break
             except Exception as e:
-                print(f"Error capturing audio: {e}")
+                if self.running:
+                    print(f"Error capturing audio: {e}")
                 await asyncio.sleep(0.01)
             
             # Small yield to prevent blocking
             await asyncio.sleep(0.001)
+    
+    async def publish_camera(self):
+        """Publish camera video to room"""
+        if not self.enable_video or not self.camera:
+            return
+        
+        # Start camera
+        if not self.camera.start():
+            print("⚠️ Camera not available, continuing without video")
+            self.enable_video = False
+            return
+        
+        # Create video source (RGBA format for LiveKit)
+        self.video_source = rtc.VideoSource(self.camera.width, self.camera.height)
+        
+        # Create local video track
+        self.local_video_track = rtc.LocalVideoTrack.create_video_track(
+            "camera",
+            self.video_source
+        )
+        
+        # Publish track
+        options = rtc.TrackPublishOptions(
+            source=rtc.TrackSource.SOURCE_CAMERA,
+        )
+        publication = await self.room.local_participant.publish_track(
+            self.local_video_track,
+            options
+        )
+        print(f"✓ Camera published: {publication.sid}")
+        
+        # Frame interval for target FPS
+        frame_interval = 1.0 / VIDEO_FPS
+        
+        # Capture and send video frames
+        while self.running:
+            try:
+                start_time = asyncio.get_event_loop().time()
+                
+                # Read frame from camera
+                frame_bgr = self.camera.read()
+                
+                if frame_bgr is not None:
+                    # Convert BGR to RGBA for LiveKit
+                    frame_rgba = self.camera.cv2.cvtColor(frame_bgr, self.camera.cv2.COLOR_BGR2RGBA)
+                    
+                    # Create VideoFrame
+                    video_frame = rtc.VideoFrame(
+                        self.camera.width,
+                        self.camera.height,
+                        rtc.VideoBufferType.RGBA,
+                        frame_rgba.tobytes()
+                    )
+                    
+                    # Capture frame
+                    self.video_source.capture_frame(video_frame)
+                
+                # Maintain target FPS
+                elapsed = asyncio.get_event_loop().time() - start_time
+                sleep_time = max(0, frame_interval - elapsed)
+                await asyncio.sleep(sleep_time)
+                
+            except Exception as e:
+                print(f"Error capturing video: {e}")
+                await asyncio.sleep(0.1)
     
     async def disconnect(self):
         """Disconnect from room and cleanup"""
         self.running = False
         self.mic.stop()
         self.speaker.stop()
+        if self.camera:
+            self.camera.stop()
         await self.room.disconnect()
         print("✓ Disconnected from room")
 
@@ -290,6 +456,7 @@ def create_token(room_name: str, identity: str) -> str:
         room=room_name,
         can_publish=True,
         can_subscribe=True,
+        can_publish_sources=["camera", "microphone"],
     ))
     return token.to_jwt()
 
@@ -299,42 +466,63 @@ def create_token(room_name: str, identity: str) -> str:
 # ============================================================
 
 async def main():
-    parser = argparse.ArgumentParser(description="LiveKit Audio Client")
+    parser = argparse.ArgumentParser(description="LiveKit Audio/Video Client")
     parser.add_argument("--room", default="vchat-room", help="Room name")
     parser.add_argument("--url", default=LIVEKIT_URL, help="LiveKit server URL")
     parser.add_argument("--identity", default="user", help="Your identity")
+    parser.add_argument("--no-video", action="store_true", help="Disable camera/video")
+    parser.add_argument("--camera", type=int, default=0, help="Camera device index")
     args = parser.parse_args()
     
+    enable_video = not args.no_video
+    
     print("═" * 50)
-    print("  VChat - LiveKit Audio Client")
+    print("  VChat - LiveKit Audio/Video Client")
+    print("═" * 50)
+    print(f"  Video: {'Enabled' if enable_video else 'Disabled'}")
     print("═" * 50)
     
     # Generate token
     token = create_token(args.room, args.identity)
     
     # Create and connect client
-    client = LiveKitClient(args.url, token, args.room)
+    client = LiveKitClient(args.url, token, args.room, enable_video=enable_video)
+    
+    # Set camera index if video enabled
+    if enable_video and client.camera:
+        client.camera.camera_index = args.camera
     
     try:
         await client.connect()
         
         print("\n" + "═" * 50)
         print("✓ CONNECTED! Voice chat active")
-        print("  Speak into your microphone...")
+        if enable_video:
+            print("  📷 Camera is streaming to AI")
+            print("  Say 'what do you see' for AI to describe your view")
+        print("  🎤 Speak into your microphone...")
         print("  Press Ctrl+C to exit")
         print("═" * 50 + "\n")
         
-        # Publish microphone and keep running
-        await client.publish_microphone()
+        # Start audio and video publishing concurrently
+        tasks = [asyncio.create_task(client.publish_microphone())]
+        if enable_video:
+            tasks.append(asyncio.create_task(client.publish_camera()))
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
         
     except KeyboardInterrupt:
         print("\n⏹ Stopping...")
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         await client.disconnect()
+        print("✓ Goodbye!")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
