@@ -69,7 +69,7 @@ pip install --upgrade pip -q
 # Install PyTorch with CUDA if GPU available
 if [ "$HAS_GPU" = true ]; then
     echo "Installing PyTorch with CUDA support..."
-    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121 -q 2>/dev/null || \
+    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128 -q 2>/dev/null || \
     pip install torch torchaudio -q
 else
     echo "Installing PyTorch (CPU)..."

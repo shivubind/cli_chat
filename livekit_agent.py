@@ -1142,6 +1142,47 @@ class VoiceAgent:
         ))
         jwt_token = token.to_jwt()
         
+        # Adjust JWT nbf claim to account for clock skew
+        try:
+            import json
+            import base64
+            import hmac
+            import hashlib
+            
+            # Decode and modify nbf to subtract 10 seconds for clock skew compensation
+            parts = jwt_token.split('.')
+            payload = parts[1]
+            # Add padding if needed
+            padding = 4 - len(payload) % 4
+            if padding and padding != 4:
+                payload += '=' * padding
+            
+            decoded_payload = json.loads(base64.urlsafe_b64decode(payload))
+            
+            # Subtract 10 seconds from nbf to account for clock skew
+            if 'nbf' in decoded_payload:
+                decoded_payload['nbf'] -= 10
+            
+            # Re-encode
+            modified_payload = base64.urlsafe_b64encode(
+                json.dumps(decoded_payload, separators=(',', ':')).encode()
+            ).decode().rstrip('=')
+            
+            # Re-sign with the secret using HMAC-SHA256
+            header_part = parts[0]
+            message = f"{header_part}.{modified_payload}"
+            signature = base64.urlsafe_b64encode(
+                hmac.new(
+                    config.livekit_api_secret.encode(),
+                    message.encode(),
+                    hashlib.sha256
+                ).digest()
+            ).decode().rstrip('=')
+            
+            jwt_token = f"{message}.{signature}"
+        except Exception as e:
+            logger.warning(f"Failed to adjust token nbf: {e}, using original token")
+        
         logger.info(f"🔗 Connecting to room: {self.room_name}")
         
         # Set up event handlers

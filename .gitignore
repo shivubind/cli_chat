@@ -22,3 +22,4 @@ memory_db/
 .env
 *.key
 *.pem
+venv_*/
