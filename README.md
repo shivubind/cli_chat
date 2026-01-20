@@ -90,7 +90,7 @@ cp env.example .env
 
 ```bash
 # Terminal 1: LiveKit Server
-livekit-server --dev
+livekit-server --dev --bind 0.0.0.0
 
 # Terminal 2: Ollama
 ollama serve
@@ -99,7 +99,7 @@ ollama serve
 python livekit_agent.py --room vchat-room
 
 # Terminal 4: Client
-python livekit_client.py --room vchat-room
+python livekit_client.py --room vchat-room --camera 0
 ```
 
 ## Configuration

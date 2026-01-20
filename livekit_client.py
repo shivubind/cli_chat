@@ -29,7 +29,7 @@ load_dotenv()
 # Configuration
 # ============================================================
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://192.168.0.125:7880")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://10.11.10.185:7880")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
 
@@ -533,7 +533,7 @@ def create_token(room_name: str, identity: str) -> str:
     return jwt_token
 
 
-# ============================================================
+# ============================================================192.168.0.125
 # Main
 # ============================================================
 
