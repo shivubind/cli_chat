@@ -21,6 +21,8 @@ import logging
 import base64
 import uuid
 import threading
+import json
+import re
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -112,13 +114,31 @@ class Config:
         return self.get("system", "prompt", default="You are a helpful voice assistant. Keep responses short.")
     
     @property
+    def robot_name(self):
+        return self.get("system", "robot_name", default="Qwen")
+    
+    @property
     def greeting(self):
         return self.get("system", "greeting", default="Hello! I'm your voice assistant. How can I help?")
+    
+    @property
+    def name_change_triggers(self):
+        return self.get("system", "name_change_triggers", default=[
+            "change your name", "change name", "call you", "your name is", "name you", "rename you"
+        ])
     
     @property
     def vision_triggers(self):
         return self.get("system", "vision_triggers", default=[
             "what do you see", "what can you see", "look at this", "describe what you see"
+        ])
+    
+    @property
+    def task_triggers(self):
+        """Keywords that indicate user is requesting a task (e.g., 'I'm hungry', 'I need')"""
+        return self.get("system", "task_triggers", default=[
+            "hungry", "thirsty", "need", "want", "get me", "give me", 
+            "pick up", "grab", "fetch", "bring me", "find", "looking for"
         ])
     
     # STT
@@ -472,16 +492,20 @@ class WhisperSTT:
 class OllamaLLM:
     """Ollama-based Language Model with Vision and Memory support"""
     
-    def __init__(self, memory: Memory = None):
+    def __init__(self, memory: Memory = None, robot_name_manager: "RobotNameManager" = None):
         self.text_model = config.text_model
         self.vision_model = config.vision_model
         self.base_url = config.ollama_base_url
         self.conversation_history = []
         self.memory = memory
+        self.robot_name_manager = robot_name_manager
     
     def _build_prompt(self, user_message: str, memory_context: str = "") -> str:
         """Build prompt with system context, memory, and history"""
-        prompt = f"System: {config.system_prompt}\n\n"
+        # Format system prompt with robot name
+        robot_name = self.robot_name_manager.get_name() if self.robot_name_manager else config.robot_name
+        system_prompt = config.system_prompt.format(name=robot_name)
+        prompt = f"System: {system_prompt}\n\n"
         
         # Add memory context if available
         if memory_context:
@@ -502,6 +526,7 @@ class OllamaLLM:
             memory_context = self.memory.get_context(text)
             if memory_context:
                 logger.info(f"🧠 Memory context found:\n{memory_context}")
+                logger.info(f"🧠text: {text}")
             else:
                 logger.debug("No relevant memories found")
         
@@ -513,6 +538,7 @@ class OllamaLLM:
         
         try:
             async with aiohttp.ClientSession() as session:
+    
                 async with session.post(
                     f"{self.base_url}/api/generate",
                     json={
@@ -534,6 +560,7 @@ class OllamaLLM:
                         if self.memory and config.memory_store_assistant:
                             self.memory.store(response, role="assistant")
                         
+                        logger.info(f"🧠response: {response}")
                         return response
                     else:
                         logger.error(f"Ollama error: {resp.status}")
@@ -542,19 +569,31 @@ class OllamaLLM:
             logger.error(f"LLM Error: {e}")
             return "Sorry, I couldn't connect to the language model."
     
-    async def generate_with_vision(self, text: str, image_base64: str) -> str:
-        """Generate response with image analysis"""
+    async def generate_with_vision(self, text: str, image_base64: str, prefer_text_model: bool = False) -> str:
+        """Generate response with image analysis
+        
+        Args:
+            text: User's text request
+            image_base64: Base64-encoded image
+            prefer_text_model: If True and text_model supports vision, use it instead of vision_model
+        """
         # 45 second timeout for vision (moondream is faster)
         timeout = aiohttp.ClientTimeout(total=45)
         
-        logger.info(f"🔍 Sending image to {self.vision_model}...")
+        # For task requests with JSON output, prefer text_model if it supports vision
+        model_to_use = self.vision_model
+        if prefer_text_model and "vl" in self.text_model.lower():
+            model_to_use = self.text_model
+            logger.info(f"🔍 Using text model for structured output: {model_to_use}")
+        
+        logger.info(f"🔍 Sending image to {model_to_use}...")
         logger.info(f"   Image size: {len(image_base64)} bytes")
         logger.info(f"   Prompt: {config.vision_prompt[:50]}...")
         
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 request_data = {
-                    "model": self.vision_model,
+                    "model": model_to_use,
                     "prompt": f"{config.vision_prompt}\n\nUser asked: {text}",
                     "images": [image_base64],
                     "stream": False,
@@ -969,6 +1008,121 @@ class SimpleVAD:
 
 
 # ============================================================
+# Robot Name Manager
+# ============================================================
+
+class RobotNameManager:
+    """Manages robot's custom name with persistent storage"""
+    
+    def __init__(self, storage_file: str = ".robot_name.txt", first_greeting_file: str = ".first_greeting_done.txt"):
+        self.storage_file = Path(storage_file)
+        self.first_greeting_file = Path(first_greeting_file)
+        self.current_name = self._load_name()
+    
+    def _load_name(self) -> str:
+        """Load saved name from file, or return default"""
+        if self.storage_file.exists():
+            try:
+                with open(self.storage_file, 'r') as f:
+                    name = f.read().strip()
+                    if name:
+                        logger.info(f"📝 Loaded robot name: {name}")
+                        return name
+            except Exception as e:
+                logger.warning(f"Could not load robot name: {e}")
+        
+        # Return default from config
+        default_name = config.robot_name
+        logger.info(f"📝 Using default robot name: {default_name}")
+        return default_name
+    
+    def is_first_greeting(self) -> bool:
+        """Check if this is the first time greeting"""
+        return not self.first_greeting_file.exists()
+    
+    def mark_first_greeting_done(self):
+        """Mark that first greeting has been done"""
+        try:
+            with open(self.first_greeting_file, 'w') as f:
+                f.write("done")
+            logger.info("✓ First greeting marked as done")
+        except Exception as e:
+            logger.warning(f"Could not save first greeting flag: {e}")
+    
+    def save_name(self, name: str) -> bool:
+        """Save new name to file"""
+        try:
+            with open(self.storage_file, 'w') as f:
+                f.write(name.strip())
+            self.current_name = name.strip()
+            logger.info(f"✓ Saved new robot name: {self.current_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save robot name: {e}")
+            return False
+    
+    def get_name(self) -> str:
+        """Get current robot name"""
+        return self.current_name
+    
+    def extract_name_from_text(self, text: str) -> str | None:
+        """Extract new name from user's text"""
+        text_lower = text.lower()
+        
+        # Patterns to extract name
+        patterns = [
+            r"call you (\w+)",
+            r"your name is (\w+)",
+            r"name you (\w+)",
+            r"change (?:your )?name to (\w+)",
+            r"rename you (?:to )?(\w+)",
+            r"i'll call you (\w+)",
+            r"i will call you (\w+)",
+        ]
+        
+        import re
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                new_name = match.group(1).capitalize()
+                logger.info(f"📝 Extracted name: {new_name}")
+                return new_name
+        
+        return None
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def extract_json_from_text(text: str) -> dict | None:
+    """Extract JSON from LLM response text (handles markdown code blocks)"""
+    try:
+        # Try direct JSON parse first
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Try to find JSON in markdown code blocks
+    json_patterns = [
+        r'```json\s*(\{.*?\})\s*```',  # ```json {...} ```
+        r'```\s*(\{.*?\})\s*```',       # ``` {...} ```
+        r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})',  # Any {...} pattern
+    ]
+    
+    for pattern in json_patterns:
+        matches = re.findall(pattern, text, re.DOTALL)
+        if matches:
+            for match in matches:
+                try:
+                    return json.loads(match)
+                except json.JSONDecodeError:
+                    continue
+    
+    return None
+
+
+# ============================================================
 # Audio Processor
 # ============================================================
 
@@ -980,7 +1134,12 @@ class AudioProcessor:
         
         self.memory = Memory()
         self.stt = WhisperSTT()
-        self.llm = OllamaLLM(memory=self.memory)
+        
+        # Robot name manager (must be created before LLM)
+        self.robot_name = RobotNameManager()
+        
+        # LLM with robot name support
+        self.llm = OllamaLLM(memory=self.memory, robot_name_manager=self.robot_name)
         self.tts = KokoroTTS()
         self.vad = SimpleVAD()
         
@@ -1007,6 +1166,24 @@ class AudioProcessor:
                 logger.info(f"👁️ Vision trigger matched: '{trigger}' in '{text}'")
                 return True
         logger.debug(f"No vision trigger in: '{text}'")
+        return False
+    
+    def _check_task_trigger(self, text: str) -> bool:
+        """Check if text contains task request keywords"""
+        text_lower = text.lower()
+        for trigger in config.task_triggers:
+            if trigger in text_lower:
+                logger.info(f"🎯 Task trigger matched: '{trigger}' in '{text}'")
+                return True
+        return False
+    
+    def _check_name_change_request(self, text: str) -> bool:
+        """Check if user wants to change robot's name"""
+        text_lower = text.lower()
+        for trigger in config.name_change_triggers:
+            if trigger in text_lower:
+                logger.info(f"🏷️ Name change trigger matched: '{trigger}' in '{text}'")
+                return True
         return False
     
     def _get_vision_image(self) -> str | None:
@@ -1073,26 +1250,76 @@ class AudioProcessor:
             
             logger.info(f"📝 User said: {text}")
             
-            # Check for vision trigger
-            if self._check_vision_trigger(text):
-                logger.info("👁️ Vision request detected")
+            # Check for name change request first
+            if self._check_name_change_request(text):
+                new_name = self.robot_name.extract_name_from_text(text)
+                if new_name:
+                    self.robot_name.save_name(new_name)
+                    response = f"Great! You can call me {new_name} from now on!"
+                else:
+                    response = "Sure! What would you like to call me?"
+                
+                logger.info(f"💬 Response: {response}")
+                logger.info("🔊 Generating speech...")
+                audio_response = self.tts.synthesize(response)
+                
+                if audio_response is not None:
+                    self.tts_playing = True
+                    logger.info(f"✓ Generated {len(audio_response)/config.tts_sample_rate:.1f}s of audio")
+                
+                return audio_response
+            
+            # Check for task trigger first (tasks need vision)
+            is_task = self._check_task_trigger(text)
+            is_vision_request = self._check_vision_trigger(text)
+            
+            # Capture vision if it's a task or explicit vision request
+            if is_task or is_vision_request:
+                if is_task:
+                    logger.info("🎯 Task request detected - capturing view...")
+                else:
+                    logger.info("👁️ Vision request detected")
+                    
                 image_base64 = self._get_vision_image()
                 
                 if image_base64:
-                    logger.info("🤖 Analyzing image...")
-                    response = await self.llm.generate_with_vision(text, image_base64)
+                    logger.info("🤖 Analyzing image with vision model...")
+                    # For task requests, prefer text_model if it supports vision (better JSON output)
+                    response = await self.llm.generate_with_vision(text, image_base64, prefer_text_model=is_task)
+                    
+                    # For task requests, try to parse JSON response
+                    if is_task:
+                        json_data = extract_json_from_text(response)
+                        
+                        if json_data:
+                            logger.info("✓ JSON response parsed successfully")
+                     
+                            verbal_reply = json_data.get("verbal_reply", response)
+                            
+                            response = verbal_reply
+                        else:
+                            logger.warning("⚠️ Could not parse JSON from task response")
+                            
+                            # Fall back to using the raw response
                 else:
                     response = "Sorry, I couldn't access any camera to see anything. Make sure video is enabled on your client."
             else:
-                # Normal text response
+                # Normal text response (no vision)
                 logger.info("🤖 Thinking...")
                 response = await self.llm.generate(text)
             
-            logger.info(f"💬 Response: {response}")
+            # Extract verbal reply if response is JSON
+            json_data = extract_json_from_text(response)
+            if json_data and "verbal_reply" in json_data:
+                tts_text = json_data.get("verbal_reply", response)
+                logger.info(f"💬 Response (verbal_reply): {tts_text}")
+            else:
+                tts_text = response
+                logger.info(f"💬 Response: {response}")
             
-            # TTS
+            # TTS - speak only the verbal reply or plain text
             logger.info("🔊 Generating speech...")
-            audio_response = self.tts.synthesize(response)
+            audio_response = self.tts.synthesize(tts_text)
             
             if audio_response is not None:
                 self.tts_playing = True
@@ -1189,8 +1416,16 @@ class VoiceAgent:
         @self.room.on("participant_connected")
         def on_participant_connected(participant: rtc.RemoteParticipant):
             logger.info(f"👤 Participant joined: {participant.identity}")
-            # Greet the new participant
-            asyncio.create_task(self._say(config.greeting))
+            # Greet the new participant with custom name
+            robot_name = self.processor.robot_name.get_name()
+            greeting = config.greeting.format(name=robot_name)
+            
+            # Add name change prompt only on first greeting ever
+            if self.processor.robot_name.is_first_greeting():
+                greeting += "If you'd like to change my name, just tell me!"
+                self.processor.robot_name.mark_first_greeting_done()
+            
+            asyncio.create_task(self._say(greeting))
         
         @self.room.on("participant_disconnected")
         def on_participant_disconnected(participant: rtc.RemoteParticipant):

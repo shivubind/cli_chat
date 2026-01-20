@@ -29,6 +29,7 @@ Real-time voice chat with AI using LiveKit WebRTC.
 - **LLM** - Ollama for local AI inference
 - **Text-to-Speech** - Kokoro for natural voice
 - **Vision** - Say "what do you see" for camera-based image analysis
+- **Task-Based Vision** - Say "I'm hungry" and AI captures view, identifies objects, and outputs JSON commands for VLA integration
 - **Memory** - ChromaDB for persistent conversation context
 - **Barge-in** - Interrupt the AI mid-speech
 - **YAML Config** - Easy customization via `config.yml`
@@ -142,7 +143,54 @@ system:
     - "what do you see"
     - "describe what you see"
     - "look at this"
+  
+  # NEW: Task triggers for VLA integration
+  task_triggers:
+    - "hungry"
+    - "thirsty"
+    - "need"
+    - "want"
+    - "pick up"
+    - "get me"
 ```
+
+## Task-Based Vision (NEW!)
+
+The agent now supports **task-oriented vision commands** that automatically:
+1. Detect task requests (e.g., "I'm hungry")
+2. Capture camera view
+3. Analyze scene for relevant objects
+4. Provide verbal response to client
+5. Output JSON command to terminal for VLA (Vision-Language-Action) integration
+
+### Example
+
+**You say:** "I'm feeling hungry"
+
+**Server does:**
+- 📷 Captures camera view
+- 🔍 Analyzes image: "I see a red apple on the table"
+- 🗣️ Responds verbally: "There is a red apple on the table, you can eat it"
+- 🖥️ Prints JSON to terminal:
+```json
+{
+  "command": "pick up red apple",
+  "thought": "User is hungry and apple is visible",
+  "timestamp": "2026-01-20T10:45:23.123456"
+}
+```
+
+### Usage
+
+Say any task-related phrase:
+- "I'm hungry" / "I'm thirsty"
+- "I need a pen"
+- "Can you get me the bottle?"
+- "Pick up the remote"
+
+The JSON commands can be captured and sent to a VLA model for robotic execution.
+
+**See [TASK_COMMANDS.md](TASK_COMMANDS.md) for detailed documentation.**
 
 ## Usage
 

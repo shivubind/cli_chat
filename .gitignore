@@ -10,6 +10,8 @@ env/
 
 .vscode/
 .idea/
+.first_greeting_done.txt
+.robot_name.txt
 
 # Large data / models
 captures/

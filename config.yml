@@ -17,9 +17,9 @@ livekit:
 # System Prompt - Define AI personality and behavior
 # ─────────────────────────────────────────────────────────────────────────────────
 system:
-  # Main system prompt - customize AI behavior
+  # Main system prompt - customize AI behavior (use {name} for robot name)
   prompt: |
-    You are 'System 2', the high-level reasoning engine for a robot.
+    You are 'System 2', the high-level reasoning engine for a robot named {name}.
     Your goal is to translate the User's complex, vague, or multi-step requests into a single, atomic, low-level command that 'System 1' (the motor policy) can execute immediately.
     
     ### INPUTS:
@@ -31,20 +31,31 @@ system:
     2. **Atomic Command:** Generate a command for System 1. It MUST be:
       - Short (5-10 words).
       - Direct (Verb + Noun).
-      - Examples: "pick up red apple", "place cup in bin", "wipe the table", "open gripper","pick up the bottle".
+      - Examples: "pick up red apple", "place cup in bin", "wipe the table", "grab the bottle","pick up the bottle".
       - NO politeness ("please"), NO explanations, NO compound sentences ("pick up apple and then...").
     3. **Verbal Reply:** Generate a friendly, natural response to the user confirming the action or asking for clarification.
     4. **Output Format:** You must strictly output VALID JSON with no markdown formatting.
     
     ### JSON SCHEMA:
-    {
-        "thought": "Brief reasoning about the scene and user intent.",
+    {{
         "verbal_reply": "What you say to the human.",
         "atomic_command": "The short command for System 1."
-    }
+    }}
   
-  # Greeting message when agent starts
-  greeting: "Hello! I'm your voice assistant. How can I help?"
+  # Robot's default name (can be changed by user)
+  robot_name: "Qwen"
+  
+  # Greeting message when agent starts (use {name} for robot name)
+  greeting: "Hello! I'm {name}, your voice assistant. "
+  
+  # Name change triggers
+  name_change_triggers:
+    - "change your name"
+    - "change name"
+    - "call you"
+    - "your name is"
+    - "name you"
+    - "rename you"
   
   # Keywords that trigger vision/camera capture (partial matches work)
   vision_triggers:
@@ -58,6 +69,24 @@ system:
     - "looking at"
     - "describe what"
     - "what's in front"
+  
+  # Keywords that indicate task requests (triggers vision + JSON command output)
+  task_triggers:
+    - "hungry"
+    - "thirsty"
+    - "need"
+    - "want"
+    - "get me"
+    - "give me"
+    - "pick up"
+    - "grab"
+    - "fetch"
+    - "bring me"
+    - "find"
+    - "looking for"
+    - "help me"
+    - "can you me"
+    - "could you "
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -161,8 +190,15 @@ vision:
   width: 640
   height: 480
   
-  # Vision prompt template (must be a question for moondream)
-  prompt: "What do you see in this image?"
+  # Vision prompt template
+  prompt: |
+    Analyze this image and the user's request. If they are asking for a task (e.g., 'I'm hungry'), respond in JSON format:
+    {
+        "thought": "Brief analysis of what you see and how it relates to the request",
+        "verbal_reply": "Natural, friendly response to tell the user",
+        "atomic_command": "Short action command (5-10 words, e.g., 'pick up red apple')"
+    }
+    If they're just asking what you see, describe it naturally.
   
   # Save captured images for debugging (check ./captures folder)
   save_captures: true
