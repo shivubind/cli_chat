@@ -1,0 +1,1696 @@
+#!/usr/bin/env python3
+"""
+LiveKit AI Voice Agent with Vision & Memory
+- Receives audio from LiveKit room participants
+- Receives video from clients for vision analysis
+- Transcribes with Whisper STT (local)
+- Generates response with Ollama LLM
+- Sends TTS response back via LiveKit
+- Vision: Can describe what client's camera sees on request
+- Memory: ChromaDB for persistent conversation memory
+
+Usage:
+  python livekit_agent.py                     # Connect to room
+  python livekit_agent.py --room my-room      # Specify room name
+  python livekit_agent.py --config custom.yml # Use custom config
+"""
+import asyncio
+import argparse
+import os
+import logging
+import base64
+import uuid
+import threading
+import json
+import re
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+import numpy as np
+import torch
+import aiohttp
+import yaml
+
+from livekit import rtc, api
+
+# Try to load dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Try to load ChromaDB
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+
+
+# ============================================================
+# Configuration Loader
+# ============================================================
+
+class Config:
+    """Configuration manager - loads from YAML file"""
+    
+    def __init__(self, config_path: str = "config.yml"):
+        self.config_path = Path(config_path)
+        self._config = {}
+        self.load()
+    
+    def load(self):
+        """Load configuration from YAML file"""
+        if self.config_path.exists():
+            with open(self.config_path, 'r') as f:
+                self._config = yaml.safe_load(f) or {}
+        else:
+            logging.warning(f"Config file {self.config_path} not found, using defaults")
+            self._config = {}
+    
+    def get(self, *keys, default=None):
+        """Get nested config value: config.get('llm', 'model', default='gpt-4')"""
+        value = self._config
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                return default
+            if value is None:
+                return default
+        return value
+    
+    # LiveKit
+    @property
+    def livekit_url(self):
+        return os.getenv("LIVEKIT_URL") or self.get("livekit", "url", default="ws://localhost:7880")
+    
+    @property
+    def livekit_api_key(self):
+        return os.getenv("LIVEKIT_API_KEY") or self.get("livekit", "api_key", default="devkey")
+    
+    @property
+    def livekit_api_secret(self):
+        return os.getenv("LIVEKIT_API_SECRET") or self.get("livekit", "api_secret", default="secret")
+    
+    @property
+    def room_name(self):
+        return self.get("livekit", "room", default="vchat-room")
+    
+    @property
+    def agent_identity(self):
+        return self.get("livekit", "agent_identity", default="ai-agent")
+    
+    @property
+    def agent_name(self):
+        return self.get("livekit", "agent_name", default="AI Voice Agent")
+    
+    # System
+    @property
+    def system_prompt(self):
+        return self.get("system", "prompt", default="You are a helpful voice assistant. Keep responses short.")
+    
+    @property
+    def robot_name(self):
+        return self.get("system", "robot_name", default="Qwen")
+    
+    @property
+    def greeting(self):
+        return self.get("system", "greeting", default="Hello! I'm your voice assistant. How can I help?")
+    
+    @property
+    def name_change_triggers(self):
+        return self.get("system", "name_change_triggers", default=[
+            "change your name", "change name", "call you", "your name is", "name you", "rename you"
+        ])
+    
+    @property
+    def vision_triggers(self):
+        return self.get("system", "vision_triggers", default=[
+            "what do you see", "what can you see", "look at this", "describe what you see"
+        ])
+    
+    @property
+    def task_triggers(self):
+        """Keywords that indicate user is requesting a task (e.g., 'I'm hungry', 'I need')"""
+        return self.get("system", "task_triggers", default=[
+            "hungry", "thirsty", "need", "want", "get me", "give me", 
+            "pick up", "grab", "fetch", "bring me", "find", "looking for"
+        ])
+    
+    # STT
+    @property
+    def whisper_model(self):
+        return os.getenv("WHISPER_MODEL") or self.get("stt", "model", default="small")
+    
+    @property
+    def whisper_language(self):
+        return self.get("stt", "language", default="en")
+    
+    @property
+    def stt_use_gpu(self):
+        return self.get("stt", "use_gpu", default=True)
+    
+    # LLM
+    @property
+    def ollama_base_url(self):
+        return os.getenv("OLLAMA_BASE_URL") or self.get("llm", "base_url", default="http://localhost:11434")
+    
+    @property
+    def text_model(self):
+        return os.getenv("OLLAMA_MODEL") or self.get("llm", "text_model", default="qwen2.5:0.5b")
+    
+    @property
+    def vision_model(self):
+        return os.getenv("OLLAMA_VISION_MODEL") or self.get("llm", "vision_model", default="qwen3-vl:2b-instruct-bf16")
+    
+    @property
+    def llm_temperature(self):
+        return self.get("llm", "temperature", default=0.7)
+    
+    @property
+    def llm_max_tokens(self):
+        return self.get("llm", "max_tokens", default=256)
+    
+    # TTS
+    @property
+    def tts_voice(self):
+        return os.getenv("KOKORO_VOICE") or self.get("tts", "voice", default="af_heart")
+    
+    @property
+    def tts_speed(self):
+        return self.get("tts", "speed", default=1.0)
+    
+    @property
+    def tts_sample_rate(self):
+        return self.get("tts", "sample_rate", default=24000)
+    
+    # Audio
+    @property
+    def sample_rate(self):
+        return self.get("audio", "sample_rate", default=48000)
+    
+    @property
+    def channels(self):
+        return self.get("audio", "channels", default=1)
+    
+    @property
+    def chunk_size(self):
+        return self.get("audio", "chunk_size", default=960)
+    
+    @property
+    def vad_threshold(self):
+        return self.get("audio", "vad", "threshold", default=0.02)
+    
+    @property
+    def vad_barge_in_threshold(self):
+        return self.get("audio", "vad", "barge_in_threshold", default=0.05)
+    
+    @property
+    def vad_silence_duration(self):
+        return self.get("audio", "vad", "silence_duration", default=1.0)
+    
+    @property
+    def vad_min_speech_duration(self):
+        return self.get("audio", "vad", "min_speech_duration", default=0.5)
+    
+    # Vision (now primarily for client video)
+    @property
+    def vision_enabled(self):
+        return self.get("vision", "enabled", default=True)
+    
+    @property
+    def camera_index(self):
+        return self.get("vision", "camera_index", default=0)
+    
+    @property
+    def vision_width(self):
+        return self.get("vision", "width", default=640)
+    
+    @property
+    def vision_height(self):
+        return self.get("vision", "height", default=480)
+    
+    @property
+    def vision_prompt(self):
+        return self.get("vision", "prompt", default="Describe what you see in this image concisely.")
+    
+    @property
+    def save_captures(self):
+        return self.get("vision", "save_captures", default=False)
+    
+    @property
+    def captures_dir(self):
+        return self.get("vision", "captures_dir", default="./captures")
+    
+    @property
+    def use_client_camera(self):
+        """Prefer client's camera over server camera"""
+        return self.get("vision", "use_client_camera", default=True)
+    
+    # Memory (ChromaDB)
+    @property
+    def memory_enabled(self):
+        return self.get("memory", "enabled", default=True) and CHROMADB_AVAILABLE
+    
+    @property
+    def memory_persist_dir(self):
+        return self.get("memory", "persist_dir", default="./memory_db")
+    
+    @property
+    def memory_collection_name(self):
+        return self.get("memory", "collection_name", default="vchat_memory")
+    
+    @property
+    def memory_top_k(self):
+        return self.get("memory", "top_k", default=3)
+    
+    @property
+    def memory_min_similarity(self):
+        return self.get("memory", "min_similarity", default=0.5)
+    
+    @property
+    def memory_store_user(self):
+        return self.get("memory", "store_user_messages", default=True)
+    
+    @property
+    def memory_store_assistant(self):
+        return self.get("memory", "store_assistant_messages", default=False)
+    
+    # Logging
+    @property
+    def log_level(self):
+        return self.get("logging", "level", default="INFO")
+    
+    @property
+    def log_format(self):
+        return self.get("logging", "format", default="%(asctime)s - %(levelname)s - %(message)s")
+
+
+# Global config instance
+config = Config()
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, config.log_level),
+    format=config.log_format
+)
+logger = logging.getLogger("vchat-agent")
+
+
+# ============================================================
+# ChromaDB Memory
+# ============================================================
+
+class Memory:
+    """Persistent memory using ChromaDB for context retrieval"""
+    
+    def __init__(self):
+        self.enabled = config.memory_enabled
+        self.client = None
+        self.collection = None
+        
+        if self.enabled:
+            self._init_chromadb()
+    
+    def _init_chromadb(self):
+        """Initialize ChromaDB client and collection"""
+        try:
+            persist_dir = Path(config.memory_persist_dir)
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            
+            self.client = chromadb.PersistentClient(
+                path=str(persist_dir),
+                settings=Settings(anonymized_telemetry=False)
+            )
+            
+            self.collection = self.client.get_or_create_collection(
+                name=config.memory_collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            
+            count = self.collection.count()
+            logger.info(f"✓ ChromaDB memory initialized ({count} memories)")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize ChromaDB: {e}")
+            self.enabled = False
+    
+    def store(self, text: str, role: str = "user", metadata: dict = None):
+        """Store a message in memory"""
+        if not self.enabled or not self.collection:
+            return
+        
+        # Skip short messages
+        if len(text.strip()) < 10:
+            return
+        
+        try:
+            doc_id = str(uuid.uuid4())
+            doc_metadata = {
+                "role": role,
+                "timestamp": datetime.now().isoformat(),
+                **(metadata or {})
+            }
+            
+            self.collection.add(
+                documents=[text],
+                ids=[doc_id],
+                metadatas=[doc_metadata]
+            )
+            logger.debug(f"💾 Stored memory: {text[:50]}...")
+            
+        except Exception as e:
+            logger.error(f"Failed to store memory: {e}")
+    
+    def retrieve(self, query: str, n_results: int = None) -> list[dict]:
+        """Retrieve relevant memories for a query"""
+        if not self.enabled or not self.collection:
+            return []
+        
+        try:
+            n_results = n_results or config.memory_top_k
+            
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=n_results,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            memories = []
+            if results and results["documents"] and results["documents"][0]:
+                for i, doc in enumerate(results["documents"][0]):
+                    distance = results["distances"][0][i] if results["distances"] else 1.0
+                    similarity = 1 - distance  # Convert distance to similarity
+                    
+                    if similarity >= config.memory_min_similarity:
+                        memories.append({
+                            "text": doc,
+                            "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
+                            "similarity": similarity
+                        })
+            
+            if memories:
+                logger.info(f"🧠 Retrieved {len(memories)} relevant memories")
+            
+            return memories
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve memories: {e}")
+            return []
+    
+    def get_context(self, query: str) -> str:
+        """Get formatted context from relevant memories"""
+        memories = self.retrieve(query)
+        
+        if not memories:
+            return ""
+        
+        # Sort by similarity (highest first)
+        memories.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        context_parts = ["[Relevant memories from past conversations - USE this information:]"]
+        for mem in memories:
+            text = mem['text']
+            # Highlight important info
+            context_parts.append(f"- {text}")
+        
+        return "\n".join(context_parts)
+    
+    def clear(self):
+        """Clear all memories"""
+        if self.enabled and self.collection:
+            try:
+                # Delete and recreate collection
+                self.client.delete_collection(config.memory_collection_name)
+                self.collection = self.client.create_collection(
+                    name=config.memory_collection_name,
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logger.info("🧹 Memory cleared")
+            except Exception as e:
+                logger.error(f"Failed to clear memory: {e}")
+
+
+# ============================================================
+# Whisper STT
+# ============================================================
+
+class WhisperSTT:
+    """Local Whisper-based Speech-to-Text"""
+    
+    def __init__(self):
+        self.model_name = config.whisper_model
+        self.model = None
+        self.device = "cuda" if (config.stt_use_gpu and torch.cuda.is_available()) else "cpu"
+    
+    def load(self):
+        if self.model is None:
+            import whisper
+            logger.info(f"Loading Whisper model: {self.model_name} on {self.device}")
+            self.model = whisper.load_model(self.model_name, device=self.device)
+            logger.info("✓ Whisper model loaded")
+    
+    def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+        """Transcribe audio to text"""
+        self.load()
+        
+        # Ensure float32
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+        
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            from scipy import signal
+            num_samples = int(len(audio_data) * 16000 / sample_rate)
+            audio_data = signal.resample(audio_data, num_samples).astype(np.float32)
+        
+        # Normalize
+        max_val = np.abs(audio_data).max()
+        if max_val > 0:
+            audio_data = audio_data / max_val
+        
+        # Transcribe
+        result = self.model.transcribe(
+            audio_data,
+            language=config.whisper_language,
+            fp16=self.device == "cuda",
+            temperature=config.get("stt", "temperature", default=0.0),
+            no_speech_threshold=config.get("stt", "no_speech_threshold", default=0.5),
+        )
+        
+        return result.get("text", "").strip()
+
+
+# ============================================================
+# Ollama LLM (with Vision & Memory support)
+# ============================================================
+
+class OllamaLLM:
+    """Ollama-based Language Model with Vision and Memory support"""
+    
+    def __init__(self, memory: Memory = None, robot_name_manager: "RobotNameManager" = None):
+        self.text_model = config.text_model
+        self.vision_model = config.vision_model
+        self.base_url = config.ollama_base_url
+        self.conversation_history = []
+        self.memory = memory
+        self.robot_name_manager = robot_name_manager
+    
+    def _build_prompt(self, user_message: str, memory_context: str = "") -> str:
+        """Build prompt with system context, memory, and history"""
+        # Format system prompt with robot name
+        robot_name = self.robot_name_manager.get_name() if self.robot_name_manager else config.robot_name
+        system_prompt = config.system_prompt.format(name=robot_name)
+        prompt = f"System: {system_prompt}\n\n"
+        
+        # Add memory context if available
+        if memory_context:
+            prompt += f"{memory_context}\n\n"
+        
+        # Add recent history (last 4 exchanges)
+        for msg in self.conversation_history[-8:]:
+            prompt += f"{msg['role'].capitalize()}: {msg['content']}\n"
+        
+        prompt += f"User: {user_message}\nAssistant:"
+        return prompt
+    
+    async def generate(self, text: str) -> str:
+        """Generate text response with memory retrieval"""
+        # Retrieve relevant memories
+        memory_context = ""
+        if self.memory:
+            memory_context = self.memory.get_context(text)
+            if memory_context:
+                logger.info(f"🧠 Memory context found:\n{memory_context}")
+                logger.info(f"🧠text: {text}")
+            else:
+                logger.debug("No relevant memories found")
+        
+        self.conversation_history.append({"role": "user", "content": text})
+        
+        # Store user message in memory
+        if self.memory and config.memory_store_user:
+            self.memory.store(text, role="user")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+    
+                async with session.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.text_model,
+                        "prompt": self._build_prompt(text, memory_context),
+                        "stream": False,
+                        "options": {
+                            "temperature": config.llm_temperature,
+                            "num_predict": config.llm_max_tokens,
+                        }
+                    }
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        response = data.get("response", "").strip()
+                        self.conversation_history.append({"role": "assistant", "content": response})
+                        
+                        # Store assistant response in memory
+                        if self.memory and config.memory_store_assistant:
+                            self.memory.store(response, role="assistant")
+                        
+                        logger.info(f"🧠response: {response}")
+                        return response
+                    else:
+                        logger.error(f"Ollama error: {resp.status}")
+                        return "Sorry, I couldn't generate a response."
+        except Exception as e:
+            logger.error(f"LLM Error: {e}")
+            return "Sorry, I couldn't connect to the language model."
+    
+    async def generate_with_vision(self, text: str, image_base64: str, prefer_text_model: bool = False) -> str:
+        """Generate response with image analysis
+        
+        Args:
+            text: User's text request
+            image_base64: Base64-encoded image
+            prefer_text_model: If True and text_model supports vision, use it instead of vision_model
+        """
+        # 45 second timeout for vision (moondream is faster)
+        timeout = aiohttp.ClientTimeout(total=45)
+        
+        # For task requests with JSON output, prefer text_model if it supports vision
+        model_to_use = self.vision_model
+        if prefer_text_model and "vl" in self.text_model.lower():
+            model_to_use = self.text_model
+            logger.info(f"🔍 Using text model for structured output: {model_to_use}")
+        
+        logger.info(f"🔍 Sending image to {model_to_use}...")
+        logger.info(f"   Image size: {len(image_base64)} bytes")
+        logger.info(f"   Prompt: {config.vision_prompt[:50]}...")
+        
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                request_data = {
+                    "model": model_to_use,
+                    "prompt": f"{config.vision_prompt}\n\nUser asked: {text}",
+                    "images": [image_base64],
+                    "stream": False,
+                    "options": {
+                        "temperature": config.llm_temperature,
+                        "num_predict": config.llm_max_tokens,
+                    }
+                }
+                
+                # Try up to 2 times if empty response
+                for attempt in range(2):
+                    async with session.post(
+                        f"{self.base_url}/api/generate",
+                        json=request_data
+                    ) as resp:
+                        logger.info(f"📡 Vision API response: {resp.status} (attempt {attempt + 1})")
+                        
+                        if resp.status == 200:
+                            data = await resp.json()
+                            response = data.get("response", "").strip()
+                            
+                            if not response:
+                                if attempt == 0:
+                                    logger.warning("⚠️ Empty response, retrying...")
+                                    await asyncio.sleep(0.5)
+                                    continue
+                                logger.warning("⚠️ Vision model returned empty response")
+                                return "I can see something but couldn't describe it clearly. Try asking again."
+                            
+                            logger.info(f"✓ Vision response: {response[:100]}...")
+                            
+                            self.conversation_history.append({"role": "user", "content": f"[Showed image] {text}"})
+                            self.conversation_history.append({"role": "assistant", "content": response})
+                            return response
+                        else:
+                            error_text = await resp.text()
+                            logger.error(f"❌ Vision model error: {resp.status}")
+                            logger.error(f"   Response: {error_text[:200]}")
+                            
+                            if "not found" in error_text.lower():
+                                return f"Vision model '{self.vision_model}' not found. Run: ollama pull {self.vision_model}"
+                            
+                            return "Sorry, I couldn't analyze the image."
+                
+                return "I couldn't describe what I see. Try again."
+                        
+        except asyncio.TimeoutError:
+            logger.error("⏱️ Vision request timed out (30s)")
+            return "Sorry, image analysis took too long. Try again."
+        except aiohttp.ClientError as e:
+            logger.error(f"❌ Connection error: {e}")
+            return "Sorry, couldn't connect to the vision model. Is Ollama running?"
+        except Exception as e:
+            logger.error(f"❌ Vision Error: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return "Sorry, I couldn't process the image."
+    
+    def clear_history(self):
+        """Clear conversation history"""
+        self.conversation_history = []
+
+
+# ============================================================
+# Kokoro TTS
+# ============================================================
+
+class KokoroTTS:
+    """Kokoro Text-to-Speech"""
+    
+    def __init__(self):
+        self.voice = config.tts_voice
+        self.speed = config.tts_speed
+        self.pipeline = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def load(self):
+        if self.pipeline is None:
+            try:
+                from kokoro import KPipeline
+                self.pipeline = KPipeline(
+                    lang_code='en-us',
+                    repo_id='hexgrad/Kokoro-82M',
+                    device=self.device
+                )
+                logger.info(f"✓ Kokoro TTS loaded on {self.device}")
+            except Exception as e:
+                logger.error(f"Failed to load Kokoro: {e}")
+                raise
+    
+    def synthesize(self, text: str) -> np.ndarray:
+        """Convert text to audio numpy array (24kHz, int16)"""
+        self.load()
+        
+        results = self.pipeline(text, voice=self.voice, speed=self.speed)
+        
+        audio_chunks = []
+        for result in results:
+            if result.audio is not None:
+                audio_chunks.append(result.audio)
+        
+        if not audio_chunks:
+            return None
+        
+        audio = torch.cat(audio_chunks, dim=-1)
+        audio_np = audio.cpu().numpy()
+        audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+        
+        return audio_int16
+
+
+# ============================================================
+# Client Video Receiver (receives video from clients)
+# ============================================================
+
+class ClientVideoReceiver:
+    """Receives and stores video frames from client participants"""
+    
+    def __init__(self):
+        self.enabled = config.vision_enabled
+        self.participant_frames = defaultdict(lambda: None)  # participant_id -> latest frame
+        self._locks = defaultdict(threading.Lock)
+        self.cv2 = None
+        
+        # Try to load OpenCV for image encoding
+        try:
+            import cv2
+            self.cv2 = cv2
+            logger.info("✓ OpenCV loaded for client video processing")
+        except ImportError:
+            logger.warning("OpenCV not available for video processing")
+    
+    def store_frame(self, participant_id: str, frame_data: bytes, width: int, height: int, format_type: str = "RGBA"):
+        """Store a video frame from a participant"""
+        if not self.enabled or self.cv2 is None:
+            return
+        
+        try:
+            # Convert bytes to numpy array based on format
+            if format_type == "RGBA":
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 4))
+                # Convert RGBA to BGR for OpenCV
+                frame_bgr = self.cv2.cvtColor(frame, self.cv2.COLOR_RGBA2BGR)
+            elif format_type == "RGB":
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
+                frame_bgr = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
+            elif format_type == "I420":
+                # YUV I420 format
+                frame_yuv = np.frombuffer(frame_data, dtype=np.uint8).reshape((height * 3 // 2, width))
+                frame_bgr = self.cv2.cvtColor(frame_yuv, self.cv2.COLOR_YUV2BGR_I420)
+            else:
+                # Assume BGR
+                frame_bgr = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
+            
+            with self._locks[participant_id]:
+                self.participant_frames[participant_id] = frame_bgr.copy()
+                
+        except Exception as e:
+            logger.error(f"Error storing frame from {participant_id}: {e}")
+    
+    def get_latest_frame(self, participant_id: str = None) -> np.ndarray | None:
+        """Get the latest frame from a participant or any available frame"""
+        if not self.enabled:
+            return None
+        
+        if participant_id and participant_id in self.participant_frames:
+            with self._locks[participant_id]:
+                frame = self.participant_frames[participant_id]
+                return frame.copy() if frame is not None else None
+        
+        # If no specific participant, get any available frame
+        for pid, frame in self.participant_frames.items():
+            if frame is not None:
+                with self._locks[pid]:
+                    return frame.copy()
+        
+        return None
+    
+    def capture_as_base64(self, participant_id: str = None, max_size: int = 320) -> str | None:
+        """Capture latest frame and return as base64 JPEG (resized for fast processing)"""
+        if not self.enabled or self.cv2 is None:
+            return None
+        
+        frame = self.get_latest_frame(participant_id)
+        
+        if frame is None:
+            logger.warning("No frame available from any client")
+            return None
+        
+        try:
+            # Resize for faster vision processing (smaller = faster)
+            h, w = frame.shape[:2]
+            if max(h, w) > max_size:
+                scale = max_size / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                frame = self.cv2.resize(frame, (new_w, new_h), interpolation=self.cv2.INTER_AREA)
+                logger.info(f"📐 Resized frame: {w}x{h} → {new_w}x{new_h}")
+            
+            # Save if configured
+            if config.save_captures:
+                captures_dir = Path(config.captures_dir)
+                captures_dir.mkdir(exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_path = captures_dir / f"client_capture_{timestamp}.jpg"
+                self.cv2.imwrite(str(save_path), frame)
+                logger.info(f"💾 Saved client capture to {save_path}")
+            
+            # Encode to JPEG with lower quality for speed
+            encode_params = [self.cv2.IMWRITE_JPEG_QUALITY, 70]
+            success, buffer = self.cv2.imencode('.jpg', frame, encode_params)
+            
+            if not success:
+                logger.error("Failed to encode frame to JPEG")
+                return None
+            
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
+            logger.info(f"✓ Client frame captured and encoded: {len(image_base64)} bytes")
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error capturing frame as base64: {e}")
+            return None
+    
+    def has_video(self, participant_id: str = None) -> bool:
+        """Check if we have video from a participant"""
+        if participant_id:
+            return self.participant_frames.get(participant_id) is not None
+        return any(f is not None for f in self.participant_frames.values())
+    
+    def remove_participant(self, participant_id: str):
+        """Remove frames for a disconnected participant"""
+        if participant_id in self.participant_frames:
+            del self.participant_frames[participant_id]
+            if participant_id in self._locks:
+                del self._locks[participant_id]
+            logger.info(f"🧹 Removed video data for {participant_id}")
+
+
+# ============================================================
+# Vision (Server Camera Capture - Fallback)
+# ============================================================
+
+class VisionCapture:
+    """Server camera capture for vision capabilities (fallback if no client video)"""
+    
+    def __init__(self, auto_init: bool = False):
+        self.enabled = config.vision_enabled
+        self.camera = None
+        self.camera_index = config.camera_index
+        self.cv2 = None
+        
+        if auto_init and self.enabled:
+            self.init_camera()
+    
+    def init_camera(self):
+        """Initialize camera - call this early to have camera ready"""
+        if self.camera is not None:
+            return True
+        
+        if not self.enabled:
+            logger.warning("Vision is disabled in config")
+            return False
+        
+        try:
+            import cv2
+            self.cv2 = cv2
+            
+            logger.info(f"📷 Opening server camera {self.camera_index}...")
+            self.camera = cv2.VideoCapture(self.camera_index)
+            
+            if not self.camera.isOpened():
+                logger.warning(f"⚠️ Could not open server camera {self.camera_index}")
+                return False
+            
+            # Set resolution
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.vision_width)
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.vision_height)
+            
+            # Warm up camera (first few frames are often dark)
+            for _ in range(5):
+                self.camera.read()
+            
+            # Get actual resolution
+            actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            logger.info(f"✓ Server camera ready: {actual_w}x{actual_h}")
+            return True
+            
+        except ImportError:
+            logger.warning("⚠️ OpenCV (cv2) not installed for server camera")
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️ Server camera initialization failed: {e}")
+            return False
+    
+    def capture(self) -> str | None:
+        """Capture image and return as base64"""
+        if not self.enabled:
+            return None
+        
+        # Initialize if not already done
+        if self.camera is None:
+            if not self.init_camera():
+                return None
+        
+        if not self.camera.isOpened():
+            return None
+        
+        try:
+            # Capture frame
+            ret, frame = self.camera.read()
+            if not ret or frame is None:
+                logger.error("Failed to capture frame from server camera")
+                return None
+            
+            logger.info(f"📸 Captured from server camera: {frame.shape[1]}x{frame.shape[0]}")
+            
+            # Save if configured
+            if config.save_captures:
+                captures_dir = Path(config.captures_dir)
+                captures_dir.mkdir(exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_path = captures_dir / f"server_capture_{timestamp}.jpg"
+                self.cv2.imwrite(str(save_path), frame)
+                logger.info(f"💾 Saved server capture to {save_path}")
+            
+            # Encode to base64
+            encode_params = [self.cv2.IMWRITE_JPEG_QUALITY, 85]
+            success, buffer = self.cv2.imencode('.jpg', frame, encode_params)
+            
+            if not success:
+                return None
+            
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
+            logger.info(f"✓ Server image encoded: {len(image_base64)} bytes")
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Server capture error: {e}")
+            return None
+    
+    def release(self):
+        """Release camera"""
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+            logger.info("📷 Server camera released")
+
+
+# ============================================================
+# Voice Activity Detection
+# ============================================================
+
+class SimpleVAD:
+    """Simple Voice Activity Detection using RMS"""
+    
+    def __init__(self):
+        self.threshold = config.vad_threshold
+        self.barge_in_threshold = config.vad_barge_in_threshold
+        self.silence_duration = config.vad_silence_duration
+        self.min_speech_duration = config.vad_min_speech_duration
+        
+        self.silence_samples = 0
+        self.speech_samples = 0
+        self.is_speaking = False
+    
+    def process(self, audio: np.ndarray, sample_rate: int) -> tuple[bool, bool]:
+        """
+        Process audio chunk and return (is_speech, end_of_speech)
+        """
+        rms = np.sqrt(np.mean(audio ** 2))
+        
+        if rms > self.threshold:
+            self.is_speaking = True
+            self.silence_samples = 0
+            self.speech_samples += len(audio)
+            return True, False
+        else:
+            if self.is_speaking:
+                self.silence_samples += len(audio)
+                silence_time = self.silence_samples / sample_rate
+                speech_time = self.speech_samples / sample_rate
+                
+                if silence_time >= self.silence_duration:
+                    self.is_speaking = False
+                    self.silence_samples = 0
+                    
+                    # Only trigger if enough speech was captured
+                    if speech_time >= self.min_speech_duration:
+                        self.speech_samples = 0
+                        return False, True  # End of speech
+                    
+                    self.speech_samples = 0
+                    return False, False
+                
+                return True, False  # Still in speech (brief pause)
+            
+            return False, False
+    
+    def is_barge_in(self, audio: np.ndarray) -> bool:
+        """Check if audio is strong enough for barge-in"""
+        rms = np.sqrt(np.mean(audio ** 2))
+        return rms > self.barge_in_threshold
+    
+    def reset(self):
+        self.silence_samples = 0
+        self.speech_samples = 0
+        self.is_speaking = False
+
+
+# ============================================================
+# Robot Name Manager
+# ============================================================
+
+class RobotNameManager:
+    """Manages robot's custom name with persistent storage"""
+    
+    def __init__(self, storage_file: str = ".robot_name.txt", first_greeting_file: str = ".first_greeting_done.txt"):
+        self.storage_file = Path(storage_file)
+        self.first_greeting_file = Path(first_greeting_file)
+        self.current_name = self._load_name()
+    
+    def _load_name(self) -> str:
+        """Load saved name from file, or return default"""
+        if self.storage_file.exists():
+            try:
+                with open(self.storage_file, 'r') as f:
+                    name = f.read().strip()
+                    if name:
+                        logger.info(f"📝 Loaded robot name: {name}")
+                        return name
+            except Exception as e:
+                logger.warning(f"Could not load robot name: {e}")
+        
+        # Return default from config
+        default_name = config.robot_name
+        logger.info(f"📝 Using default robot name: {default_name}")
+        return default_name
+    
+    def is_first_greeting(self) -> bool:
+        """Check if this is the first time greeting"""
+        return not self.first_greeting_file.exists()
+    
+    def mark_first_greeting_done(self):
+        """Mark that first greeting has been done"""
+        try:
+            with open(self.first_greeting_file, 'w') as f:
+                f.write("done")
+            logger.info("✓ First greeting marked as done")
+        except Exception as e:
+            logger.warning(f"Could not save first greeting flag: {e}")
+    
+    def save_name(self, name: str) -> bool:
+        """Save new name to file"""
+        try:
+            with open(self.storage_file, 'w') as f:
+                f.write(name.strip())
+            self.current_name = name.strip()
+            logger.info(f"✓ Saved new robot name: {self.current_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save robot name: {e}")
+            return False
+    
+    def get_name(self) -> str:
+        """Get current robot name"""
+        return self.current_name
+    
+    def extract_name_from_text(self, text: str) -> str | None:
+        """Extract new name from user's text"""
+        text_lower = text.lower()
+        
+        # Patterns to extract name
+        patterns = [
+            r"call you (\w+)",
+            r"your name is (\w+)",
+            r"name you (\w+)",
+            r"change (?:your )?name to (\w+)",
+            r"rename you (?:to )?(\w+)",
+            r"i'll call you (\w+)",
+            r"i will call you (\w+)",
+        ]
+        
+        import re
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                new_name = match.group(1).capitalize()
+                logger.info(f"📝 Extracted name: {new_name}")
+                return new_name
+        
+        return None
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def extract_json_from_text(text: str) -> dict | None:
+    """Extract JSON from LLM response text (handles markdown code blocks)"""
+    try:
+        # Try direct JSON parse first
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Try to find JSON in markdown code blocks
+    json_patterns = [
+        r'```json\s*(\{.*?\})\s*```',  # ```json {...} ```
+        r'```\s*(\{.*?\})\s*```',       # ``` {...} ```
+        r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})',  # Any {...} pattern
+    ]
+    
+    for pattern in json_patterns:
+        matches = re.findall(pattern, text, re.DOTALL)
+        if matches:
+            for match in matches:
+                try:
+                    return json.loads(match)
+                except json.JSONDecodeError:
+                    continue
+    
+    return None
+
+
+# ============================================================
+# Audio Processor
+# ============================================================
+
+class AudioProcessor:
+    """Processes audio: STT → LLM → TTS (with Vision & Memory support)"""
+    
+    def __init__(self, client_video_receiver: ClientVideoReceiver = None):
+        logger.info("Initializing AudioProcessor...")
+        
+        self.memory = Memory()
+        self.stt = WhisperSTT()
+        
+        # Robot name manager (must be created before LLM)
+        self.robot_name = RobotNameManager()
+        
+        # LLM with robot name support
+        self.llm = OllamaLLM(memory=self.memory, robot_name_manager=self.robot_name)
+        self.tts = KokoroTTS()
+        self.vad = SimpleVAD()
+        
+        # Client video receiver (primary vision source)
+        self.client_video = client_video_receiver or ClientVideoReceiver()
+        
+        # Server camera as fallback
+        self.server_camera = VisionCapture(auto_init=False)
+        
+        self.audio_buffer = []
+        self.is_processing = False
+        self.tts_playing = False
+        
+        # Track current speaking participant for vision
+        self.current_participant = None
+        
+        logger.info("✓ AudioProcessor ready")
+    
+    def _check_vision_trigger(self, text: str) -> bool:
+        """Check if text contains vision trigger phrase"""
+        text_lower = text.lower()
+        for trigger in config.vision_triggers:
+            if trigger in text_lower:
+                logger.info(f"👁️ Vision trigger matched: '{trigger}' in '{text}'")
+                return True
+        logger.debug(f"No vision trigger in: '{text}'")
+        return False
+    
+    def _check_task_trigger(self, text: str) -> bool:
+        """Check if text contains task request keywords"""
+        text_lower = text.lower()
+        for trigger in config.task_triggers:
+            if trigger in text_lower:
+                logger.info(f"🎯 Task trigger matched: '{trigger}' in '{text}'")
+                return True
+        return False
+    
+    def _check_name_change_request(self, text: str) -> bool:
+        """Check if user wants to change robot's name"""
+        text_lower = text.lower()
+        for trigger in config.name_change_triggers:
+            if trigger in text_lower:
+                logger.info(f"🏷️ Name change trigger matched: '{trigger}' in '{text}'")
+                return True
+        return False
+    
+    def _get_vision_image(self) -> str | None:
+        """Get image from client video or fallback to server camera"""
+        # Prefer client video if available and configured
+        if config.use_client_camera and self.client_video.has_video():
+            logger.info("📷 Using client camera for vision")
+            # Use 384px for good balance of speed and quality
+            image = self.client_video.capture_as_base64(self.current_participant, max_size=384)
+            if image:
+                return image
+            logger.warning("⚠️ Client video available but capture failed")
+        
+        # Fallback to server camera
+        logger.info("📷 Falling back to server camera for vision")
+        if not self.server_camera.camera:
+            self.server_camera.init_camera()
+        return self.server_camera.capture()
+    
+    def add_audio(self, audio: np.ndarray, sample_rate: int, participant_id: str = None) -> bool:
+        """Add audio chunk, return True if ready to process"""
+        # Track who is speaking for vision targeting
+        self.current_participant = participant_id
+        
+        # Check for barge-in
+        if self.tts_playing:
+            if self.vad.is_barge_in(audio):
+                logger.info("🛑 Barge-in detected!")
+                self.tts_playing = False
+                self.vad.reset()
+                self.audio_buffer = [audio]
+                return False
+            return False
+        
+        if self.is_processing:
+            return False
+        
+        is_speech, end_of_speech = self.vad.process(audio, sample_rate)
+        
+        if is_speech or self.vad.is_speaking:
+            self.audio_buffer.append(audio)
+        
+        return end_of_speech and len(self.audio_buffer) > 0
+    
+    async def process(self) -> np.ndarray | None:
+        """Process accumulated audio and return TTS response"""
+        if not self.audio_buffer or self.is_processing:
+            return None
+        
+        self.is_processing = True
+        
+        try:
+            # Concatenate audio
+            audio = np.concatenate(self.audio_buffer)
+            self.audio_buffer = []
+            self.vad.reset()
+            
+            logger.info("🎤 Transcribing...")
+            text = self.stt.transcribe(audio, config.sample_rate)
+            
+            if not text.strip():
+                logger.info("(No speech detected)")
+                return None
+            
+            logger.info(f"📝 User said: {text}")
+            
+            # Check for name change request first
+            if self._check_name_change_request(text):
+                new_name = self.robot_name.extract_name_from_text(text)
+                if new_name:
+                    self.robot_name.save_name(new_name)
+                    response = f"Great! You can call me {new_name} from now on!"
+                else:
+                    response = "Sure! What would you like to call me?"
+                
+                logger.info(f"💬 Response: {response}")
+                logger.info("🔊 Generating speech...")
+                audio_response = self.tts.synthesize(response)
+                
+                if audio_response is not None:
+                    self.tts_playing = True
+                    logger.info(f"✓ Generated {len(audio_response)/config.tts_sample_rate:.1f}s of audio")
+                
+                return audio_response
+            
+            # Check for task trigger first (tasks need vision)
+            is_task = self._check_task_trigger(text)
+            is_vision_request = self._check_vision_trigger(text)
+            
+            # Capture vision if it's a task or explicit vision request
+            if is_task or is_vision_request:
+                if is_task:
+                    logger.info("🎯 Task request detected - capturing view...")
+                else:
+                    logger.info("👁️ Vision request detected")
+                    
+                image_base64 = self._get_vision_image()
+                
+                if image_base64:
+                    logger.info("🤖 Analyzing image with vision model...")
+                    # For task requests, prefer text_model if it supports vision (better JSON output)
+                    response = await self.llm.generate_with_vision(text, image_base64, prefer_text_model=is_task)
+                    
+                    # For task requests, try to parse JSON response
+                    if is_task:
+                        json_data = extract_json_from_text(response)
+                        
+                        if json_data:
+                            logger.info("✓ JSON response parsed successfully")
+                     
+                            verbal_reply = json_data.get("verbal_reply", response)
+                            
+                            response = verbal_reply
+                        else:
+                            logger.warning("⚠️ Could not parse JSON from task response")
+                            
+                            # Fall back to using the raw response
+                else:
+                    response = "Sorry, I couldn't access any camera to see anything. Make sure video is enabled on your client."
+            else:
+                # Normal text response (no vision)
+                logger.info("🤖 Thinking...")
+                response = await self.llm.generate(text)
+            
+            # Extract verbal reply if response is JSON
+            json_data = extract_json_from_text(response)
+            if json_data and "verbal_reply" in json_data:
+                tts_text = json_data.get("verbal_reply", response)
+                logger.info(f"💬 Response (verbal_reply): {tts_text}")
+            else:
+                tts_text = response
+                logger.info(f"💬 Response: {response}")
+            
+            # TTS - speak only the verbal reply or plain text
+            logger.info("🔊 Generating speech...")
+            audio_response = self.tts.synthesize(tts_text)
+            
+            if audio_response is not None:
+                self.tts_playing = True
+                logger.info(f"✓ Generated {len(audio_response)/config.tts_sample_rate:.1f}s of audio")
+            
+            return audio_response
+            
+        finally:
+            self.is_processing = False
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.server_camera.release()
+
+
+# ============================================================
+# LiveKit Agent
+# ============================================================
+
+class VoiceAgent:
+    """LiveKit Voice Agent with Vision from Client Video"""
+    
+    def __init__(self, room_name: str = None):
+        self.room_name = room_name or config.room_name
+        self.room = rtc.Room()
+        
+        # Create client video receiver first
+        self.client_video = ClientVideoReceiver()
+        
+        # Create processor with client video receiver
+        self.processor = AudioProcessor(client_video_receiver=self.client_video)
+        
+        self.audio_source = None
+        self.running = False
+    
+    async def connect(self):
+        """Connect to LiveKit room"""
+        # Generate token
+        token = api.AccessToken(config.livekit_api_key, config.livekit_api_secret)
+        token.with_identity(config.agent_identity)
+        token.with_name(config.agent_name)
+        token.with_grants(api.VideoGrants(
+            room_join=True,
+            room=self.room_name,
+            can_publish=True,
+            can_subscribe=True,
+        ))
+        jwt_token = token.to_jwt()
+        
+        # Adjust JWT nbf claim to account for clock skew
+        try:
+            import json
+            import base64
+            import hmac
+            import hashlib
+            
+            # Decode and modify nbf to subtract 30 seconds for clock skew compensation
+            parts = jwt_token.split('.')
+            payload = parts[1]
+            # Add padding if needed
+            padding = 4 - len(payload) % 4
+            if padding and padding != 4:
+                payload += '=' * padding
+            
+            decoded_payload = json.loads(base64.urlsafe_b64decode(payload))
+            
+            # Subtract 30 seconds from nbf to account for clock skew
+            if 'nbf' in decoded_payload:
+                decoded_payload['nbf'] -= 30
+            
+            # Re-encode
+            modified_payload = base64.urlsafe_b64encode(
+                json.dumps(decoded_payload, separators=(',', ':')).encode()
+            ).decode().rstrip('=')
+            
+            # Re-sign with the secret using HMAC-SHA256
+            header_part = parts[0]
+            message = f"{header_part}.{modified_payload}"
+            signature = base64.urlsafe_b64encode(
+                hmac.new(
+                    config.livekit_api_secret.encode(),
+                    message.encode(),
+                    hashlib.sha256
+                ).digest()
+            ).decode().rstrip('=')
+            
+            jwt_token = f"{message}.{signature}"
+        except Exception as e:
+            logger.warning(f"Failed to adjust token nbf: {e}, using original token")
+        
+        logger.info(f"🔗 Connecting to room: {self.room_name}")
+        
+        # Set up event handlers
+        @self.room.on("participant_connected")
+        def on_participant_connected(participant: rtc.RemoteParticipant):
+            logger.info(f"👤 Participant joined: {participant.identity}")
+            # Greet the new participant with custom name
+            robot_name = self.processor.robot_name.get_name()
+            greeting = config.greeting.format(name=robot_name)
+            
+            # Add name change prompt only on first greeting ever
+            if self.processor.robot_name.is_first_greeting():
+                greeting += "If you'd like to change my name, just tell me!"
+                self.processor.robot_name.mark_first_greeting_done()
+            
+            asyncio.create_task(self._say(greeting))
+        
+        @self.room.on("participant_disconnected")
+        def on_participant_disconnected(participant: rtc.RemoteParticipant):
+            logger.info(f"👤 Participant left: {participant.identity}")
+            # Clean up video data for this participant
+            self.client_video.remove_participant(participant.identity)
+        
+        @self.room.on("track_subscribed")
+        def on_track_subscribed(
+            track: rtc.Track,
+            publication: rtc.RemoteTrackPublication,
+            participant: rtc.RemoteParticipant,
+        ):
+            if track.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info(f"🎵 Subscribed to audio from: {participant.identity}")
+                asyncio.create_task(self._handle_audio_track(track, participant))
+            elif track.kind == rtc.TrackKind.KIND_VIDEO:
+                logger.info(f"📹 Subscribed to video from: {participant.identity}")
+                asyncio.create_task(self._handle_video_track(track, participant))
+        
+        @self.room.on("disconnected")
+        def on_disconnected():
+            logger.info("❌ Disconnected from room")
+            self.running = False
+        
+        # Connect
+        await self.room.connect(config.livekit_url, jwt_token)
+        logger.info(f"✓ Connected to room: {self.room.name}")
+        
+        self.running = True
+        
+        # Create and publish audio source for TTS
+        self.audio_source = rtc.AudioSource(config.sample_rate, config.channels)
+        local_track = rtc.LocalAudioTrack.create_audio_track("agent-voice", self.audio_source)
+        
+        options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+        
+        # Publish track with error handling
+        try:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    publication = await asyncio.wait_for(
+                        self.room.local_participant.publish_track(local_track, options),
+                        timeout=15.0
+                    )
+                    logger.info("✓ Audio track published")
+                    # Wait a bit for track to be ready before sending audio
+                    await asyncio.sleep(0.5)
+                    break
+                except asyncio.TimeoutError:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Publish timeout (attempt {attempt + 1}/{max_retries}), retrying...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Publish error: {e} (attempt {attempt + 1}/{max_retries}), retrying...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+        except Exception as e:
+            logger.error(f"❌ Failed to publish audio track: {e}")
+            raise
+        
+        # Print info
+        logger.info("═" * 50)
+        logger.info("✓ Voice Agent Active")
+        logger.info(f"  Room: {self.room_name}")
+        logger.info(f"  STT: Whisper ({config.whisper_model})")
+        logger.info(f"  LLM: Ollama ({config.text_model})")
+        logger.info(f"  Vision: {config.vision_model if config.vision_enabled else 'Disabled'}")
+        logger.info(f"  Vision Source: Client Camera (preferred) / Server Fallback")
+        logger.info(f"  TTS: Kokoro ({config.tts_voice})")
+        logger.info(f"  Memory: {'ChromaDB' if config.memory_enabled else 'Disabled'}")
+        logger.info("═" * 50)
+        logger.info("Waiting for participants...")
+        
+        # Pre-load TTS to avoid delay on first message
+        try:
+            self.processor.tts.load()
+        except Exception as e:
+            logger.warning(f"Could not preload TTS: {e}")
+    
+    async def _handle_audio_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
+        """Handle incoming audio from participant"""
+        audio_stream = rtc.AudioStream(track)
+        
+        async for event in audio_stream:
+            if not self.running:
+                break
+            
+            frame = event.frame
+            
+            # Convert to numpy
+            audio_data = np.frombuffer(bytes(frame.data), dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Add to processor with participant ID for vision targeting
+            if self.processor.add_audio(audio_data, frame.sample_rate, participant.identity):
+                # Process and respond
+                response_audio = await self.processor.process()
+                
+                if response_audio is not None:
+                    await self._send_audio(response_audio, config.tts_sample_rate)
+                    self.processor.tts_playing = False
+    
+    async def _handle_video_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
+        """Handle incoming video from participant for vision"""
+        logger.info(f"📹 Starting video processing for: {participant.identity}")
+        
+        video_stream = rtc.VideoStream(track)
+        frame_count = 0
+        
+        async for event in video_stream:
+            if not self.running:
+                break
+            
+            frame = event.frame
+            frame_count += 1
+            
+            # Log periodically
+            if frame_count == 1:
+                logger.info(f"📹 Receiving video from {participant.identity}: {frame.width}x{frame.height}")
+            
+            # Get frame data and store it
+            try:
+                # Convert frame to RGBA bytes
+                argb_frame = frame.convert(rtc.VideoBufferType.RGBA)
+                frame_data = bytes(argb_frame.data)
+                
+                self.client_video.store_frame(
+                    participant.identity,
+                    frame_data,
+                    frame.width,
+                    frame.height,
+                    "RGBA"
+                )
+                
+            except Exception as e:
+                if frame_count <= 3:
+                    logger.error(f"Error processing video frame: {e}")
+    
+    async def _say(self, text: str):
+        """Say something using TTS"""
+        logger.info(f"🔊 Saying: {text}")
+        try:
+            audio = self.processor.tts.synthesize(text)
+            if audio is not None:
+                logger.info(f"📢 Sending {len(audio)/config.tts_sample_rate:.1f}s of audio...")
+                self.processor.tts_playing = True
+                await self._send_audio(audio, config.tts_sample_rate)
+                self.processor.tts_playing = False
+                logger.info("✓ Audio sent")
+            else:
+                logger.error("❌ TTS returned no audio")
+        except Exception as e:
+            logger.error(f"❌ Error in _say: {e}")
+            self.processor.tts_playing = False
+    
+    async def _send_audio(self, audio: np.ndarray, source_rate: int):
+        """Send audio through LiveKit with error handling"""
+        from scipy import signal
+        
+        try:
+            # Convert to float for resampling
+            audio_float = audio.astype(np.float32)
+            
+            # Resample to output sample rate if needed
+            if source_rate != config.sample_rate:
+                num_samples = int(len(audio_float) * config.sample_rate / source_rate)
+                audio_float = signal.resample(audio_float, num_samples)
+            
+            # Convert back to int16 with proper clipping
+            audio_int16 = np.clip(audio_float, -32768, 32767).astype(np.int16)
+            
+            # Send in chunks
+            chunk_size = config.chunk_size
+            total_chunks = (len(audio_int16) + chunk_size - 1) // chunk_size
+            
+            for i in range(0, len(audio_int16), chunk_size):
+                if not self.running:
+                    break
+                
+                chunk = audio_int16[i:i+chunk_size]
+                
+                # Pad if needed
+                if len(chunk) < chunk_size:
+                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                
+                try:
+                    # Create frame and copy data
+                    frame = rtc.AudioFrame.create(config.sample_rate, config.channels, chunk_size)
+                    frame_data = np.frombuffer(frame.data, dtype=np.int16)
+                    np.copyto(frame_data, chunk)
+                    
+                    # Capture frame with error handling
+                    await self.audio_source.capture_frame(frame)
+                    
+                    # Wait for real-time playback (20ms per chunk at 48kHz)
+                    await asyncio.sleep(0.019)
+                except Exception as frame_error:
+                    # Log and skip this frame instead of crashing
+                    if "InvalidState" in str(frame_error) or "failed to capture" in str(frame_error):
+                        logger.debug(f"Frame capture skipped: {frame_error}")
+                        # Small delay before retrying next frame
+                        await asyncio.sleep(0.05)
+                    else:
+                        logger.error(f"Error sending audio frame: {frame_error}")
+                        raise
+        except Exception as e:
+            logger.error(f"❌ Error in _send_audio: {e}")
+            # Don't raise - let the TTS continue even if audio send fails
+
+    
+    async def run(self):
+        """Run the agent"""
+        while self.running:
+            await asyncio.sleep(0.3)
+    
+    async def disconnect(self):
+        """Disconnect from room"""
+        self.running = False
+        self.processor.cleanup()
+        await self.room.disconnect()
+        logger.info("✓ Disconnected")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+async def main():
+    parser = argparse.ArgumentParser(description="LiveKit AI Voice Agent with Vision")
+    parser.add_argument("--room", default=None, help="Room name (overrides config)")
+    parser.add_argument("--config", default="config.yml", help="Config file path")
+    args = parser.parse_args()
+    
+    # Reload config if custom path specified
+    global config
+    if args.config != "config.yml":
+        config = Config(args.config)
+    
+    print("═" * 50)
+    print("  VChat - LiveKit AI Voice Agent")
+    print("═" * 50)
+    print(f"  Config: {args.config}")
+    print(f"  Vision: {'Enabled (Client + Server)' if config.vision_enabled else 'Disabled'}")
+    print(f"  Memory: {'ChromaDB' if config.memory_enabled else 'Disabled'}")
+    print("═" * 50)
+    
+    agent = VoiceAgent(args.room)
+    
+    try:
+        await agent.connect()
+        await agent.run()
+    except KeyboardInterrupt:
+        print("\n⏹ Stopping...")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        await agent.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

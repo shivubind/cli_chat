@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+.vscode/
+.idea/
+.first_greeting_done.txt
+.robot_name.txt
+
+# Large data / models
+captures/
+memory_db/
+*.zip
+*.tar
+*.tar.gz
+
+# Secrets
+.env
+*.key
+*.pem
+venv_*/

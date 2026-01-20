@@ -1,0 +1,246 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# VChat Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# LiveKit Server Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+livekit:
+  url: "ws://localhost:7880"
+  api_key: "devkey"
+  api_secret: "secret"
+  room: "vchat-room"
+  agent_identity: "ai-agent"
+  agent_name: "AI Voice Agent"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# System Prompt - Define AI personality and behavior
+# ─────────────────────────────────────────────────────────────────────────────────
+system:
+  # Main system prompt - customize AI behavior (use {name} for robot name)
+  prompt: |
+    You are 'System 2', the high-level reasoning engine for a robot named {name}.
+    Your goal is to translate the User's complex, vague, or multi-step requests into a single, atomic, low-level command that 'System 1' (the motor policy) can execute immediately.
+    
+    ### INPUTS:
+    1. An image of the robot's current view.
+    2. A text request from the user (which may be messy, implicit, or contain feedback).
+    
+    ### RULES:
+    1. **Analyze First:** Look at the image. Is the user's request possible? What specific object is referred to?
+    2. **Atomic Command:** Generate a command for System 1. It MUST be:
+      - Short (5-10 words).
+      - Direct (Verb + Noun).
+      - Examples: "pick up red apple", "place cup in bin", "wipe the table", "grab the bottle","pick up the bottle".
+      - NO politeness ("please"), NO explanations, NO compound sentences ("pick up apple and then...").
+    3. **Verbal Reply:** Generate a friendly, natural response to the user confirming the action or asking for clarification.
+    4. **Output Format:** You must strictly output VALID JSON with no markdown formatting.
+    
+    ### JSON SCHEMA:
+    {{
+        "verbal_reply": "What you say to the human.",
+        "atomic_command": "The short command for System 1."
+    }}
+  
+  # Robot's default name (can be changed by user)
+  robot_name: "Qwen"
+  
+  # Greeting message when agent starts (use {name} for robot name)
+  greeting: "Hello! I'm {name}, your voice assistant. "
+  
+  # Name change triggers
+  name_change_triggers:
+    - "change your name"
+    - "change name"
+    - "call you"
+    - "your name is"
+    - "name you"
+    - "rename you"
+  
+  # Keywords that trigger vision/camera capture (partial matches work)
+  vision_triggers:
+    - "what do you see"
+    - "what you see"
+    - "what can you see"
+    - "you see"
+    - "do you see"
+    - "can you see"
+    - "look at"
+    - "looking at"
+    - "describe what"
+    - "what's in front"
+  
+  # Keywords that indicate task requests (triggers vision + JSON command output)
+  task_triggers:
+    - "hungry"
+    - "thirsty"
+    - "need"
+    - "want"
+    - "get me"
+    - "give me"
+    - "pick up"
+    - "grab"
+    - "fetch"
+    - "bring me"
+    - "find"
+    - "looking for"
+    - "help me"
+    - "can you me"
+    - "could you "
+
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Speech-to-Text (STT) Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+stt:
+  # Whisper model: tiny, base, small, medium, large, large-v2, large-v3
+  # Smaller = faster, larger = more accurate
+  model: "small"
+  language: "en"
+  
+  # Use GPU if available
+  use_gpu: true
+  
+  # Transcription settings
+  temperature: 0.0
+  no_speech_threshold: 0.5
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Large Language Model (LLM) Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+llm:
+  # Ollama settings
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+  
+  # Text model for conversation
+  text_model: "qwen3-vl:2b-instruct-bf16" # "qwen2.5:0.5b"
+  
+  # Vision model for image analysis (must support vision)
+  # moondream = fastest (1.7GB), llava = accurate (4.7GB), qwen3-vl = slow (4.3GB)
+  vision_model: "moondream"
+  
+  # Generation settings (lower = faster)
+  temperature: 0.5
+  max_tokens: 100
+  
+  # Stream response (faster perceived response)
+  stream: false
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Text-to-Speech (TTS) Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+tts:
+  # Kokoro settings
+  provider: "kokoro"
+  
+  # Voice ID - Kokoro voices:
+  # af_heart, af_bella, af_nicole, af_sarah, af_sky
+  # am_adam, am_michael, bf_emma, bf_isabella, bm_george, bm_lewis
+  voice: "am_puck"
+  
+  # Speech speed (0.5 = slow, 1.0 = normal, 2.0 = fast)
+  speed: 1.0
+  
+  # Output sample rate
+  sample_rate: 24000
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Audio Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+audio:
+  # Sample rate for audio processing
+  sample_rate: 48000
+  channels: 1
+  
+  # Chunk size in samples (960 = 20ms at 48kHz)
+  chunk_size: 960
+  
+  # Voice Activity Detection (VAD)
+  vad:
+    # RMS threshold for speech detection (0.0-1.0)
+    # Lower = more sensitive, Higher = less sensitive
+    threshold: 0.02
+    
+    # Strong speech threshold for barge-in detection
+    barge_in_threshold: 0.05
+    
+    # Seconds of silence before processing speech
+    silence_duration: 0.5
+    
+    # Minimum speech duration to process (seconds)
+    min_speech_duration: 0.5
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Vision Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+vision:
+  # Enable vision capability
+  enabled: true
+  
+  # Prefer client's camera over server camera (recommended)
+  # When true: Uses video stream from client (what user sees)
+  # When false: Uses server's local camera
+  use_client_camera: true
+  
+  # Server camera device index (fallback if no client video)
+  camera_index: 0
+  
+  # Image capture settings
+  width: 640
+  height: 480
+  
+  # Vision prompt template
+  prompt: |
+    Analyze this image and the user's request. If they are asking for a task (e.g., 'I'm hungry'), respond in JSON format:
+    {
+        "thought": "Brief analysis of what you see and how it relates to the request",
+        "verbal_reply": "Natural, friendly response to tell the user",
+        "atomic_command": "Short action command (5-10 words, e.g., 'pick up red apple')"
+    }
+    If they're just asking what you see, describe it naturally.
+  
+  # Save captured images for debugging (check ./captures folder)
+  save_captures: true
+  captures_dir: "./captures"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Memory Configuration (ChromaDB)
+# ─────────────────────────────────────────────────────────────────────────────────
+memory:
+  # Enable persistent memory
+  enabled: true
+  
+  # ChromaDB persistence directory
+  persist_dir: "./memory_db"
+  
+  # Collection name for this agent
+  collection_name: "vchat_memory"
+  
+  # Number of relevant memories to retrieve per query
+  top_k: 5
+  
+  # Minimum similarity score to include memory (0.0-1.0)
+  # Lower = more memories retrieved, Higher = stricter matching
+  min_similarity: 0.35
+  
+  # Store user messages in memory
+  store_user_messages: true
+  
+  # Store assistant responses in memory
+  store_assistant_messages: false
+  
+  # Memory categories
+  categories:
+    - "personal"      # User's personal info (name, preferences)
+    - "facts"         # Facts user has shared
+    - "preferences"   # User preferences
+    - "context"       # Conversation context
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Logging Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+

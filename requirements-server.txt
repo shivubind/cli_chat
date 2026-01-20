@@ -1,0 +1,44 @@
+# VChat Server Requirements
+# Install: pip install -r requirements-server.txt
+
+# LiveKit SDK
+livekit>=0.13.0
+livekit-api>=0.7.0
+
+# PyTorch
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# STT - Whisper
+openai-whisper>=20231117
+scipy>=1.11.0
+
+# TTS - Kokoro
+kokoro>=0.9.0
+huggingface-hub>=0.20.0
+transformers>=4.30.0
+misaki[en]>=0.8.0
+
+# LLM - Ollama API
+aiohttp>=3.9.0
+
+# Vision
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Memory - ChromaDB
+chromadb>=0.4.0
+
+# Utilities
+numpy>=1.24.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+httpx>=0.25.0
+
+# Dependencies
+urllib3>=2.0.0,<2.4.0
+requests>=2.31.0
+click>=8.1.0
+typer>=0.9.0
+distro>=1.8.0
+spacy>=3.7.0
