@@ -34,6 +34,13 @@ import yaml
 
 from livekit import rtc, api
 
+# Import agent tools
+try:
+    from agent_tools import ToolManager
+    TOOLS_AVAILABLE = True
+except ImportError:
+    TOOLS_AVAILABLE = False
+
 # Try to load dotenv
 try:
     from dotenv import load_dotenv
@@ -279,6 +286,15 @@ class Config:
     @property
     def memory_store_assistant(self):
         return self.get("memory", "store_assistant_messages", default=False)
+    
+    # Tools
+    @property
+    def tools_enabled(self):
+        return self.get("tools", "enabled", default=False) and TOOLS_AVAILABLE
+    
+    @property
+    def tools_config(self):
+        return self.get("tools", default={})
     
     # Logging
     @property
@@ -1149,6 +1165,17 @@ class AudioProcessor:
         # Server camera as fallback
         self.server_camera = VisionCapture(auto_init=False)
         
+        # Tools system
+        self.tools_enabled = config.tools_enabled
+        self.tool_manager = None
+        if self.tools_enabled:
+            try:
+                self.tool_manager = ToolManager(config.tools_config)
+                logger.info(f"✓ Tools enabled: {self.tool_manager.list_tools()}")
+            except Exception as e:
+                logger.error(f"Failed to initialize tools: {e}")
+                self.tools_enabled = False
+        
         self.audio_buffer = []
         self.is_processing = False
         self.tts_playing = False
@@ -1203,6 +1230,110 @@ class AudioProcessor:
             self.server_camera.init_camera()
         return self.server_camera.capture()
     
+    async def _handle_tool_request(self, user_text: str, tool_request: dict) -> str:
+        """Handle tool execution request
+        
+        Args:
+            user_text: Original user text
+            tool_request: Parsed tool request from ToolManager
+        
+        Returns:
+            Response text to speak
+        """
+        tool_name = tool_request.get("tool")
+        action = tool_request.get("action")
+        
+        logger.info(f"🔧 Executing tool: {tool_name}.{action}")
+        
+        # Special handling for different tools
+        if tool_name == "wifi":
+            if action == "list":
+                result = await self.tool_manager.execute_tool("wifi", action="list")
+                if result.get("success"):
+                    networks = result.get("networks", [])
+                    if networks:
+                        network_names = [n["ssid"] for n in networks[:5]]
+                        return f"I found {result['count']} networks. The strongest are: {', '.join(network_names)}."
+                    return "No WiFi networks found."
+                return f"Sorry, I couldn't scan for networks: {result.get('error')}"
+            
+            elif action == "status":
+                result = await self.tool_manager.execute_tool("wifi", action="status")
+                if result.get("success"):
+                    state = result.get("state")
+                    connection = result.get("connection", "Not connected")
+                    if state == "connected":
+                        return f"You're connected to {connection}."
+                    return "WiFi is disconnected."
+                return f"Sorry, I couldn't check WiFi status: {result.get('error')}"
+            
+            elif action == "connect":
+                # Extract SSID from user text
+                # Simple extraction - look for quoted text or last word
+                import re
+                match = re.search(r'"([^"]+)"', user_text) or re.search(r"'([^']+)'", user_text)
+                if match:
+                    ssid = match.group(1)
+                else:
+                    # Get last significant word
+                    words = user_text.split()
+                    ssid = words[-1] if words else ""
+                
+                if ssid:
+                    return f"To connect to {ssid}, I need the password. Please say 'connect to {ssid} with password your-password'"
+                return "Which network would you like to connect to?"
+            
+            elif action == "disconnect":
+                result = await self.tool_manager.execute_tool("wifi", action="disconnect")
+                if result.get("success"):
+                    return "WiFi disconnected."
+                return f"Sorry, I couldn't disconnect: {result.get('error')}"
+        
+        elif tool_name == "email":
+            return "To send an email, I need the recipient, subject, and message. Email functionality requires configuration. Please set EMAIL_USER and EMAIL_PASSWORD environment variables."
+        
+        elif tool_name == "browser":
+            # Extract URL from user text
+            import re
+            url_match = re.search(r'https?://[^\s]+', user_text)
+            if url_match:
+                url = url_match.group(0)
+            else:
+                # Look for domain-like patterns
+                words = user_text.lower().split()
+                if "google" in words:
+                    url = "google.com"
+                else:
+                    # Try to extract last word as URL
+                    url = words[-1] if words else ""
+            
+            if url:
+                result = await self.tool_manager.execute_tool("browser", url=url)
+                if result.get("success"):
+                    return f"Opened {url} in your browser."
+                return f"Sorry, I couldn't open the browser: {result.get('error')}"
+            return "Which website would you like me to open?"
+        
+        elif tool_name == "files":
+            if action == "list":
+                result = await self.tool_manager.execute_tool("files", action="list")
+                if result.get("success"):
+                    files = result.get("files", [])
+                    if files:
+                        file_names = [f["name"] for f in files[:5]]
+                        return f"In {result['directory']}, I see: {', '.join(file_names)}. Total {result['count']} items."
+                    return f"{result['directory']} is empty."
+                return f"Sorry, I couldn't list files: {result.get('error')}"
+            
+            return f"File operation '{action}' needs more details."
+        
+        elif tool_name == "system":
+            # Execute simple system commands
+            return "System commands are available but need specific command details."
+        
+        # Fallback - use LLM to generate response
+        return await self.llm.generate(f"The user asked: {user_text}. This seems to be a request for {tool_name} - {action}. Respond helpfully.")
+    
     def add_audio(self, audio: np.ndarray, sample_rate: int, participant_id: str = None) -> bool:
         """Add audio chunk, return True if ready to process"""
         # Track who is speaking for vision targeting
@@ -1250,7 +1381,24 @@ class AudioProcessor:
             
             logger.info(f"📝 User said: {text}")
             
-            # Check for name change request first
+            # Check for tool requests first
+            if self.tools_enabled and self.tool_manager:
+                tool_request = self.tool_manager.parse_tool_request(text)
+                if tool_request:
+                    logger.info(f"🔧 Tool request detected: {tool_request}")
+                    response = await self._handle_tool_request(text, tool_request)
+                    
+                    logger.info(f"💬 Response: {response}")
+                    logger.info("🔊 Generating speech...")
+                    audio_response = self.tts.synthesize(response)
+                    
+                    if audio_response is not None:
+                        self.tts_playing = True
+                        logger.info(f"✓ Generated {len(audio_response)/config.tts_sample_rate:.1f}s of audio")
+                    
+                    return audio_response
+            
+            # Check for name change request
             if self._check_name_change_request(text):
                 new_name = self.robot_name.extract_name_from_text(text)
                 if new_name:
@@ -1502,6 +1650,10 @@ class VoiceAgent:
         logger.info(f"  Vision Source: Client Camera (preferred) / Server Fallback")
         logger.info(f"  TTS: Kokoro ({config.tts_voice})")
         logger.info(f"  Memory: {'ChromaDB' if config.memory_enabled else 'Disabled'}")
+        if config.tools_enabled and self.processor.tool_manager:
+            logger.info(f"  Tools: {', '.join(self.processor.tool_manager.list_tools())}")
+        else:
+            logger.info("  Tools: Disabled")
         logger.info("═" * 50)
         logger.info("Waiting for participants...")
         
@@ -1675,6 +1827,7 @@ async def main():
     print(f"  Config: {args.config}")
     print(f"  Vision: {'Enabled (Client + Server)' if config.vision_enabled else 'Disabled'}")
     print(f"  Memory: {'ChromaDB' if config.memory_enabled else 'Disabled'}")
+    print(f"  Tools: {'Enabled' if config.tools_enabled else 'Disabled'}")
     print("═" * 50)
     
     agent = VoiceAgent(args.room)

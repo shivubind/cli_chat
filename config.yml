@@ -244,3 +244,51 @@ logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR
   format: "%(asctime)s - %(levelname)s - %(message)s"
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tools Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+tools:
+  # Enable/disable tool system
+  enabled: true
+  
+  # WiFi management
+  wifi:
+    enabled: true
+  
+  # Email sending
+  email:
+    enabled: true
+    smtp:
+      server: "smtp.gmail.com"
+      port: 587
+      # Set EMAIL_USER and EMAIL_PASSWORD environment variables
+      # Or configure here (not recommended for security):
+      # username: "your-email@gmail.com"
+      # password: "your-app-password"
+  
+  # Web browser control
+  browser:
+    enabled: true
+  
+  # System commands (whitelisted for security)
+  system:
+    enabled: true
+    allowed_commands:
+      - "ls"
+      - "pwd"
+      - "date"
+      - "whoami"
+      - "uptime"
+      - "df"
+      - "free"
+      - "hostname"
+      - "ip"
+  
+  # File operations (restricted directories)
+  files:
+    enabled: true
+    allowed_directories:
+      - "~/Documents"
+      - "~/Downloads"
+      - "/tmp"

@@ -42,5 +42,6 @@ room:
 # # Start with new config
 # livekit-server --config livekit.yaml --dev --bind 0.0.0.0
 # netstat -tlnp | grep 7880
+
 # # Should show: 0.0.0.0:7880 (not 127.0.0.1:7880)
 # python livekit_client.py --server 192.168.0.125
